@@ -260,6 +260,18 @@ class ManimCanvas(QOpenGLWidget):
         else:
             super().mouseReleaseEvent(event)
 
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        """Handle mouse double click to toggle isolation mode."""
+        if self._drag_controller is None or event.button() != Qt.MouseButton.LeftButton:
+            super().mouseDoubleClickEvent(event)
+            return
+
+        pos = event.position()
+        if self._drag_controller.on_mouse_double_click(int(pos.x()), int(pos.y())):
+            pass
+        else:
+            super().mouseDoubleClickEvent(event)
+
     # ────────────────────────────────────────────────────────────
     # First-Time Initialization (runs once in first paintGL)
     # ────────────────────────────────────────────────────────────

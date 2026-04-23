@@ -116,7 +116,7 @@ OpenGLMobject.__init__ = _patched_opengl_mobject_init
 
 # ── Now safe to import everything else ──
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QSurfaceFormat, QPalette, QColor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -489,6 +489,28 @@ class MainWindow(QMainWindow):
         else:
             logger.error("Full reload FAILED — scene unchanged")
             self.status_bar.showMessage("⚠ Scene reload failed")
+
+    def _on_transform_drag_requested(self, target_var: str, method_name: str, value: float) -> None:
+        """Handle transform drag with debouncing to avoid freezing."""
+        self._pending_transform = (target_var, method_name, value)
+        self._transform_drag_timer.start()
+
+    def _execute_debounced_transform_reload(self) -> None:
+        """Apply the pending transform and perform a full reload safely."""
+        if not self._pending_transform:
+            return
+            
+        target_var, method_name, value = self._pending_transform
+        self._pending_transform = None
+        
+        # AST surgery: modify source code in memory
+        self.ast_mutator.update_transform_method(target_var, method_name, value)
+        
+        scene_file = self.ast_mutator._file_path
+        if scene_file:
+            self.ast_mutator.save_atomic()
+            # Fast update for transform changes instead of full reload to prevent flicker
+            self._do_full_reload(str(scene_file))
 
     # ────────────────────────────────────────────────────────────
     # Animation Toolbar

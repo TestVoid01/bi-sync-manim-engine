@@ -105,6 +105,10 @@ class PropertyFinder(ast.NodeVisitor):
             if func_name in self._known_constructors:
                 # Extract keyword arguments as properties
                 props = {}
+                # Special case: Text/Tex often have the string as the first positional arg
+                if func_name in ("Text", "Tex", "MathTex") and call_node.args:
+                    props["text"] = self._extract_value(call_node.args[0])
+                    
                 for kw in call_node.keywords:
                     if kw.arg is not None:
                         props[kw.arg] = self._extract_value(kw.value)
@@ -338,6 +342,17 @@ class PropertyUpdater(ast.NodeTransformer):
             and node.targets[0].id == self._target_var
             and isinstance(node.value, ast.Call)
         ):
+            # Special case for "text" property in Text/Tex (first positional arg)
+            if self._prop_name == "text" and node.value.args:
+                if isinstance(node.value.args[0], ast.Constant):
+                    node.value.args[0] = ast.Constant(value=self._new_value)
+                    self._modified = True
+                    logger.info(
+                        f"AST Surgery: {self._target_var}.text "
+                        f"→ {self._new_value} (line {node.lineno})"
+                    )
+                return node
+                
             # Found the target assignment — modify the keyword
             for kw in node.value.keywords:
                 if kw.arg == self._prop_name:

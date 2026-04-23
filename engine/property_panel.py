@@ -83,6 +83,11 @@ MANIM_SCHEMA = {
         "x_length": 10.0,
         "y_length": 10.0,
     },
+    "Text": {
+        "color": "WHITE",
+        "font_size": 48.0,
+        "fill_opacity": 1.0,
+    },
     "Tex": {
         "color": "WHITE",
         "fill_opacity": 1.0,
@@ -328,11 +333,12 @@ class PropertyPanel(QDockWidget):
         Code → GUI: File change → parse → update sliders
     """
 
+    transform_drag_requested = pyqtSignal(str, str, float)
+
     def __init__(
         self,
         engine_state: EngineState,
-        ast_mutator: ASTMutator,
-        hot_swap: HotSwapInjector,
+        ast_mutator: ASTMutator,        hot_swap: HotSwapInjector,
         file_watcher: Optional[SceneFileWatcher] = None,
         parent: Optional[QWidget] = None,
     ) -> None:

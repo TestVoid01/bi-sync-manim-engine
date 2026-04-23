@@ -75,6 +75,7 @@ class DragController:
         self._selected_mob_id: Optional[int] = None
         self._selected_var_name: Optional[str] = None
         self._selected_mob_line_num: Optional[int] = None
+        self._selected_mob_path: list[int] = []
 
         # SPSC-style: only store LATEST position
         self._pending_pos: Optional[tuple[float, float]] = None
@@ -96,6 +97,38 @@ class DragController:
     def set_scene(self, scene: Any) -> None:
         """Set the active scene for mobject lookup."""
         self._scene = scene
+
+    def on_mouse_double_click(self, px: int, py: int) -> bool:
+        """Handle mouse double click to toggle isolation mode."""
+        math_x, math_y = self._coord.pixel_to_math(px, py)
+        
+        mob_id = self._hit_tester.test(math_x, math_y)
+        if mob_id is None:
+            # Clicked empty space -> Exit isolation mode
+            if self._engine_state.isolated_mobject_id is not None:
+                self._engine_state.isolated_mobject_id = None
+                self._engine_state.isolated_mobject_path = []
+                self._engine_state.request_render()
+                logger.info("Exited isolation mode.")
+            return False
+            
+        result = self._hit_tester.find_mobject_and_path(mob_id, self._scene)
+        if result:
+            top_level_mob, hit_mob, path = result
+            # Enter isolation mode for the top-level parent if not already isolated
+            if self._engine_state.isolated_mobject_id != id(top_level_mob):
+                self._engine_state.isolated_mobject_id = id(top_level_mob)
+                self._engine_state.isolated_mobject_path = []
+                logger.info(f"Entered isolation mode for mobject {id(top_level_mob)}")
+            else:
+                # Already isolated, drill down to the exact child
+                self._engine_state.isolated_mobject_path = path
+                logger.info(f"Drilled down to path {path} in isolated mobject")
+                
+            self._engine_state.request_render()
+            return True
+            
+        return False
 
     def on_mouse_press(self, px: int, py: int) -> bool:
         """Handle mouse press — test for hit and start drag.
@@ -129,6 +162,7 @@ class DragController:
             self._selected_mob = mob
             self._selected_var_name = target_var
             self._selected_mob_line_num = anim_ref.line_number
+            self._selected_mob_path = []
             self._engine_state.set_selected_mobject_name(target_var)
             
             # Fix Ghost Snap-to-Cursor Jump: Calculate offset based on animation target args
@@ -157,15 +191,27 @@ class DragController:
             self._engine_state.set_selected_mobject_name(None)
             return False
 
-        # Find the actual mobject instance
-        mob = self._hit_tester.find_mobject_by_id(mob_id, self._scene)
-        if mob is None:
+        # Find the actual mobject instance and path
+        result = self._hit_tester.find_mobject_and_path(mob_id, self._scene)
+        if result is None:
             return False
+            
+        top_level_mob, hit_mob, path = result
+
+        # Determine which mobject to actually select based on isolation mode
+        if self._engine_state.isolated_mobject_id == id(top_level_mob):
+            # We are in isolation mode for this object. Select the specific hit child.
+            mob = hit_mob
+            selected_path = path
+        else:
+            # Normal mode: select the top-level object
+            mob = top_level_mob
+            selected_path = []
 
         # Get variable name and line number for AST updates
-        ast_ref = self._hit_tester.get_ast_ref(mob)
+        ast_ref = self._hit_tester.get_ast_ref(top_level_mob)
         if ast_ref is None:
-            logger.debug(f"No AST mapping for {type(mob).__name__}, skipping drag")
+            logger.debug(f"No AST mapping for {type(top_level_mob).__name__}, skipping drag")
             return False
 
         var_name = ast_ref.variable_name
@@ -183,7 +229,11 @@ class DragController:
         self._selected_mob_id = mob_id
         self._selected_var_name = var_name
         self._selected_mob_line_num = line_num
-        self._engine_state.set_selected_mobject_name(var_name)
+        self._selected_mob_path = selected_path
+        
+        # Display name could show path, e.g. axes[0][1]
+        display_name = var_name + "".join(f"[{i}]" for i in selected_path)
+        self._engine_state.set_selected_mobject_name(display_name)
 
         # Pause file watcher (Socket 5)
         if self._file_watcher:
@@ -193,7 +243,7 @@ class DragController:
         self._drag_timer.start()
 
         logger.info(
-            f"Drag started: {var_name} (Line {line_num}) "
+            f"Drag started: {display_name} (Line {line_num}) "
             f"at ({math_x:.2f}, {math_y:.2f})"
         )
         return True
@@ -236,6 +286,7 @@ class DragController:
             self._selected_mob_id = None
             self._selected_var_name = None
             self._selected_mob_line_num = None
+            self._selected_mob_path = []
             self._pending_pos = None
             if self._file_watcher:
                 self._file_watcher.resume()
@@ -274,18 +325,19 @@ class DragController:
                 except Exception as e:
                     logger.error(f"Failed to update animation target: {e}")
             else:
-                # Phase 4: Initial State update
+                # Phase 4/6: Initial State update
                 center = self._selected_mob.get_center()
                 final_x = round(float(center[0]), 2)
                 final_y = round(float(center[1]), 2)
 
                 # Update AST: add/modify .shift() or .move_to() call
                 self._update_ast_position(
-                    self._selected_var_name, final_x, final_y, self._selected_mob_line_num
+                    self._selected_var_name, final_x, final_y, self._selected_mob_line_num, self._selected_mob_path
                 )
 
+                display_name = self._selected_var_name + "".join(f"[{i}]" for i in self._selected_mob_path)
                 logger.info(
-                    f"Drag complete: {self._selected_var_name} → "
+                    f"Drag complete: {display_name} → "
                     f"({final_x}, {final_y})"
                 )
 
@@ -300,6 +352,7 @@ class DragController:
         self._selected_mob_id = None
         self._selected_var_name = None
         self._selected_mob_line_num = None
+        self._selected_mob_path = []
         self._pending_pos = None
 
     def _process_pending_drag(self) -> None:
@@ -335,7 +388,7 @@ class DragController:
             logger.error(f"Drag update error: {e}")
 
     def _update_ast_position(
-        self, var_name: str, x: float, y: float, mob_line_num: Optional[int] = None
+        self, var_name: str, x: float, y: float, mob_line_num: Optional[int] = None, path: list[int] = None
     ) -> None:
         """Update the AST with the final drag position.
 
@@ -345,19 +398,36 @@ class DragController:
         """
         import ast as ast_mod
 
+        if path is None:
+            path = []
+
         try:
             if self._ast_mutator._tree is None:
                 return
 
             target_node = None
+            
+            # Helper to check if a node represents var_name[path[0]]...
+            def matches_target(node):
+                if not path:
+                    return isinstance(node, ast_mod.Name) and node.id == var_name
+                # Need to match Subscript nodes
+                current = node
+                for index in reversed(path):
+                    if not isinstance(current, ast_mod.Subscript):
+                        return False
+                    if not isinstance(current.slice, ast_mod.Constant) or current.slice.value != index:
+                        return False
+                    current = current.value
+                return isinstance(current, ast_mod.Name) and current.id == var_name
+
             for node in ast_mod.walk(self._ast_mutator._tree):
                 if (
                     isinstance(node, ast_mod.Expr)
                     and isinstance(node.value, ast_mod.Call)
                     and isinstance(node.value.func, ast_mod.Attribute)
                     and node.value.func.attr in ("shift", "move_to")
-                    and isinstance(node.value.func.value, ast_mod.Name)
-                    and node.value.func.value.id == var_name
+                    and matches_target(node.value.func.value)
                 ):
                     node_line = getattr(node, 'lineno', -1)
                     if mob_line_num is not None and node_line >= mob_line_num:
@@ -383,19 +453,32 @@ class DragController:
                 ]
                 target_node.value.keywords = []
                 ast_mod.fix_missing_locations(self._ast_mutator._tree)
+                
+                path_str = "".join(f"[{i}]" for i in path)
                 logger.info(
-                    f"AST Surgery: {var_name}.move_to([{x}, {y}, 0.0]) at line {target_node.lineno}"
+                    f"AST Surgery: {var_name}{path_str}.move_to([{x}, {y}, 0.0]) at line {target_node.lineno}"
                 )
             elif mob_line_num is not None:
                 # The object doesn't have an existing .move_to() or .shift()
                 # We must inject a NEW .move_to() call right after its definition line.
                 class MoveCallInjector(ast_mod.NodeTransformer):
-                    def __init__(self, target, nx, ny, line):
+                    def __init__(self, target, path_indices, nx, ny, line):
                         self.target = target
+                        self.path_indices = path_indices
                         self.nx = nx
                         self.ny = ny
                         self.line = line
                         self.injected = False
+                        
+                    def _build_target_node(self):
+                        node = ast_mod.Name(id=self.target, ctx=ast_mod.Load())
+                        for index in self.path_indices:
+                            node = ast_mod.Subscript(
+                                value=node,
+                                slice=ast_mod.Constant(value=index),
+                                ctx=ast_mod.Load()
+                            )
+                        return node
 
                     def insert_after(self, node_list):
                         new_list = []
@@ -405,7 +488,7 @@ class DragController:
                                 move_stmt = ast_mod.Expr(
                                     value=ast_mod.Call(
                                         func=ast_mod.Attribute(
-                                            value=ast_mod.Name(id=self.target, ctx=ast_mod.Load()),
+                                            value=self._build_target_node(),
                                             attr='move_to',
                                             ctx=ast_mod.Load()
                                         ),
@@ -434,11 +517,12 @@ class DragController:
                                 setattr(node, field, self.insert_after(value))
                         return node
 
-                injector = MoveCallInjector(var_name, x, y, mob_line_num)
+                injector = MoveCallInjector(var_name, path, x, y, mob_line_num)
                 self._ast_mutator._tree = injector.visit(self._ast_mutator._tree)
                 ast_mod.fix_missing_locations(self._ast_mutator._tree)
+                path_str = "".join(f"[{i}]" for i in path)
                 if injector.injected:
-                    logger.info(f"AST Injection: Inserted {var_name}.move_to([{x}, {y}, 0.0]) after line {mob_line_num}")
+                    logger.info(f"AST Injection: Inserted {var_name}{path_str}.move_to([{x}, {y}, 0.0]) after line {mob_line_num}")
                 else:
                     logger.warning(f"AST Injection failed: Could not find insertion point after line {mob_line_num}")
             

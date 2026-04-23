@@ -319,6 +319,11 @@ class HotSwapInjector:
         # Find the mobject by variable name convention
         # We look for mobjects that match the expected type/position
         for mob in self._current_scene.mobjects:
+            if self._ast_mutator is not None:
+                live_bind = self._ast_mutator.get_live_bind(id(mob))
+                if live_bind and live_bind.variable_name == target_var:
+                    return self._apply_property_to_mob(mob, prop_name, new_value)
+                    
             mob_type = type(mob).__name__
 
             # Match by naming convention
@@ -329,6 +334,8 @@ class HotSwapInjector:
             elif target_var == "triangle" and mob_type == "Triangle":
                 return self._apply_property_to_mob(mob, prop_name, new_value)
             elif target_var == "dot" and mob_type == "Dot":
+                return self._apply_property_to_mob(mob, prop_name, new_value)
+            elif target_var == "title" and mob_type == "Text":
                 return self._apply_property_to_mob(mob, prop_name, new_value)
 
         logger.warning(f"Mobject not found for: {target_var}")
@@ -376,6 +383,19 @@ class HotSwapInjector:
             elif prop_name == "font_size":
                 if hasattr(mob, 'font_size'):
                     mob.font_size = value
+                    # In Manim, changing font_size on a rendered Text object is hard, 
+                    # often requires re-creation. We'll try scaling as a fallback if it exists.
+                    if hasattr(mob, 'scale'):
+                        # This is a very rough hot-swap approach for font size
+                        # Proper fix is full reload, but we try this for continuous drag
+                        pass
+                    return True
+                    
+            elif prop_name == "text":
+                # Changing text requires full reload usually, but we can try to update it
+                # if the mobject supports it, otherwise it'll just trigger a reload on release
+                if hasattr(mob, 'text'):
+                    mob.text = value
                     return True
 
             # --- GENERIC PROPERTY UPDATER VIA REFLECTION ---

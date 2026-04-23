@@ -233,16 +233,22 @@ class HijackedRenderer(OpenGLRenderer):
         # Extract AABB for hit-testing (Socket 2)
         if self._engine_state is not None:
             try:
-                points = mobject.points
-                if points is not None and len(points) > 0:
-                    min_x = float(np.min(points[:, 0]))
-                    min_y = float(np.min(points[:, 1]))
-                    max_x = float(np.max(points[:, 0]))
-                    max_y = float(np.max(points[:, 1]))
-                    self._engine_state.push_hitbox(
-                        id(mobject),
-                        (min_x, min_y, max_x, max_y),
-                    )
+                # Always prefer get_bounding_box for comprehensive hitboxes 
+                # (works for Text, VGroups, and complex leaf nodes)
+                bb = mobject.get_bounding_box()
+                if bb is not None and len(bb) == 3:
+                    import numpy as np
+                    min_x, min_y = float(bb[0][0]), float(bb[0][1])
+                    max_x, max_y = float(bb[2][0]), float(bb[2][1])
+                    
+                    # Ignore invalid or empty bounding boxes
+                    if not (np.isnan(min_x) or np.isnan(min_y) or np.isnan(max_x) or np.isnan(max_y)):
+                        # Expand hitbox slightly for easier clicking on thin objects (like text or lines)
+                        padding = 0.1
+                        self._engine_state.push_hitbox(
+                            id(mobject),
+                            (min_x - padding, min_y - padding, max_x + padding, max_y + padding),
+                        )
             except Exception:
                 # Don't let hitbox extraction crash the render pipeline
                 pass

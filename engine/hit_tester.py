@@ -74,28 +74,42 @@ class HitTester:
 
         return best_id
 
-    def find_mobject_by_id(self, mobject_id: int, scene: Any) -> Optional[Any]:
-        """Find the actual Mobject instance from its Python id().
+    def find_mobject_and_path(self, mobject_id: int, scene: Any) -> Optional[tuple[Any, Any, list[int]]]:
+        """Find the top-level Mobject, the hit sub-mobject, and its index path.
 
         Args:
-            mobject_id: Python id() of the target mobject
+            mobject_id: Python id() of the target mobject (might be a leaf node)
             scene: The Manim Scene containing mobjects
 
         Returns:
-            The Mobject instance, or None
+            (top_level_mob, hit_mob, path_indices) or None
         """
         if scene is None:
             return None
 
-        for mob in scene.mobjects:
-            if id(mob) == mobject_id:
-                return mob
-            # Also check submobjects
+        def search(mob: Any, target_id: int, current_path: list[int]) -> Optional[tuple[Any, list[int]]]:
+            if id(mob) == target_id:
+                return mob, current_path
             if hasattr(mob, 'submobjects'):
-                for sub in mob.submobjects:
-                    if id(sub) == mobject_id:
-                        return sub
+                for i, sub in enumerate(mob.submobjects):
+                    res = search(sub, target_id, current_path + [i])
+                    if res is not None:
+                        return res
+            return None
 
+        for mob in scene.mobjects:
+            result = search(mob, mobject_id, [])
+            if result is not None:
+                hit_mob, path = result
+                return mob, hit_mob, path
+
+        return None
+
+    def find_mobject_by_id(self, mobject_id: int, scene: Any) -> Optional[Any]:
+        """Legacy helper for flat searches. For deep hierarchies use find_mobject_and_path."""
+        result = self.find_mobject_and_path(mobject_id, scene)
+        if result:
+            return result[1] # Return the exact hit mob
         return None
 
     def get_ast_ref(self, mobject: Any) -> Optional[ASTNodeRef]:

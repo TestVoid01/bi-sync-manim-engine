@@ -70,6 +70,10 @@ class EngineState:
         # ── Phase 6: Deep Graphical Control (Selection Tracking) ──
         self._selected_mobject_name: Optional[str] = None
         self._selection_callbacks: list[Callable[[Optional[str]], None]] = []
+        
+        # Isolation Mode
+        self.isolated_mobject_id: Optional[int] = None
+        self.isolated_mobject_path: list[int] = []
 
         logger.info("EngineState initialized with 5 sockets")
 
