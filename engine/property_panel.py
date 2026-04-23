@@ -510,6 +510,20 @@ class PropertyPanel(QDockWidget):
         )
         transform_layout.addWidget(scale_slider)
         self._dynamic_sliders["_scale"] = scale_slider # special key for syncing
+        
+        # Rotate Slider
+        import math
+        rotate_val = ref.transforms.get("rotate", 0.0)
+        rotate_slider = PropertySlider(label="rotate", min_val=-math.pi*2, max_val=math.pi*2, initial=float(rotate_val))
+        rotate_slider.value_changed.connect(
+            lambda v, v_name=self._current_var_name: self._on_transform_drag(v_name, "rotate", v)
+        )
+        rotate_slider.value_released.connect(
+            lambda v, v_name=self._current_var_name: self._on_transform_release(v_name, "rotate", v)
+        )
+        transform_layout.addWidget(rotate_slider)
+        self._dynamic_sliders["_rotate"] = rotate_slider
+        
         self._content_layout.addWidget(transform_group)
 
         # ---------------------------------------------------------------------
@@ -538,6 +552,7 @@ class PropertyPanel(QDockWidget):
                     self._on_animation_type_change(v_name, old_eff, text)
             )
             anim_layout.addWidget(anim_dropdown)
+            self._dynamic_sliders["_anim_dropdown"] = anim_dropdown
             
             # Run Time Slider
             run_time_val = target_anim.kwargs.get("run_time", 1.0)
@@ -549,6 +564,7 @@ class PropertyPanel(QDockWidget):
                 lambda v, v_name=self._current_var_name: self._on_animation_kwarg_release(v_name, "run_time", v)
             )
             anim_layout.addWidget(rt_slider)
+            self._dynamic_sliders["_run_time"] = rt_slider
             
             self._content_layout.addWidget(anim_group)
 
@@ -593,9 +609,19 @@ class PropertyPanel(QDockWidget):
         """Fast path for transform (e.g. scale) updates during drag."""
         if self._file_watcher:
             self._file_watcher.pause()
-        # For hot-swapping transform we will just apply it
-        self._hot_swap.apply_transform(target_var, method_name, value)
-        self._engine_state.request_render()
+        
+        # We emit a signal so main.py can debounce and handle the full reload safely
+        if hasattr(self, 'transform_drag_requested'):
+            self.transform_drag_requested.emit(target_var, method_name, value)
+        else:
+            # Fallback if signal isn't wired up yet
+            self._ast_mutator.update_transform_method(target_var, method_name, value)
+            import os
+            scene_file = self._ast_mutator._file_path
+            if scene_file:
+                self._ast_mutator.save_atomic()
+                self._hot_swap.reload_from_file(scene_file)
+            self._engine_state.request_render()
 
     def _on_transform_release(self, target_var: str, method_name: str, value: float) -> None:
         """Slow path for transform (e.g. scale) updates."""
@@ -653,5 +679,31 @@ class PropertyPanel(QDockWidget):
                     widget.set_value(float(val))
                 elif isinstance(val, str) and isinstance(widget, PropertyString):
                     widget.set_value(val)
+                    
+        if "_scale" in self._dynamic_sliders:
+            scale_val = ref.transforms.get("scale", 1.0)
+            self._dynamic_sliders["_scale"].set_value(float(scale_val))
+            
+        if "_rotate" in self._dynamic_sliders:
+            rotate_val = ref.transforms.get("rotate", 0.0)
+            self._dynamic_sliders["_rotate"].set_value(float(rotate_val))
+            
+        # Sync animation effects
+        target_anim = None
+        for anim in self._ast_mutator.animations:
+            if anim.target_var == self._current_var_name:
+                target_anim = anim
+                break
+                
+        if target_anim:
+            if "_anim_dropdown" in self._dynamic_sliders:
+                # Keep case sensitivity for display if possible
+                anim_effects = ["Create", "Write", "FadeIn", "FadeOut", "GrowFromCenter", "SpinInFromNothing", "DrawBorderThenFill"]
+                current_effect = next((e for e in anim_effects if e.lower() == target_anim.method_name.lower()), target_anim.method_name)
+                self._dynamic_sliders["_anim_dropdown"].set_value(current_effect)
+                
+            if "_run_time" in self._dynamic_sliders:
+                run_time_val = target_anim.kwargs.get("run_time", 1.0)
+                self._dynamic_sliders["_run_time"].set_value(float(run_time_val))
 
         logger.info("Dynamic sliders synced from code (State Reconciliation)")

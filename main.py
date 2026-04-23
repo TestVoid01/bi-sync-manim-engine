@@ -299,6 +299,14 @@ class MainWindow(QMainWindow):
         )
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.property_panel)
 
+        # Wire transform drag to full reload
+        self.property_panel.transform_drag_requested.connect(self._on_transform_drag_requested)
+        self._transform_drag_timer = QTimer()
+        self._transform_drag_timer.setSingleShot(True)
+        self._transform_drag_timer.setInterval(200) # 200ms debounce
+        self._transform_drag_timer.timeout.connect(self._execute_debounced_transform_reload)
+        self._pending_transform: Optional[tuple[str, str, float]] = None
+
         # ── Code Editor (Left Dock) ──
         self.code_editor = CodeEditorPanel(
             scene_file=scene_path,
