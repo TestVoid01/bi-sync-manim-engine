@@ -1,26 +1,87 @@
-# Phase 6.2: Transform & Animation Control
+# Zero-Config Bi-Sync Architecture: Implementation Plan
 
-This phase will upgrade the Bi-Sync Engine so it can graphically manipulate operations that occur *after* the object is created, such as scaling, rotating, and `self.play` animations.
+Goal: Transform the engine into a true "Zero-Config" system where any Manim object is automatically detected, introspected, and synchronized with the AST without hardcoded schemas or whitelists.
 
-## Proposed Changes
-
-### 1. Transform Control (`scale` & `rotate`)
-Currently, `ASTMutator` only tracks properties inside the constructor (e.g. `Triangle(color=RED)`).
-- **AST Enhancement**: We will upgrade the AST parser to scan for standalone method calls like `triangle.scale(1.6)`.
-- **GUI Addition**: We will add a permanent `scale` and `rotation` slider to the `PropertyPanel`.
-- **Injection Logic**: If the user moves the scale slider but `.scale()` doesn't exist in code, the engine will use our previously built `MoveCallInjector` logic to safely inject `.scale(X)` right below the object creation.
-
-### 2. Animation Type Control (`QComboBox`)
-- **GUI Addition**: When an object is clicked, the `PropertyPanel` will check if it is part of an animation. If yes, it will generate a new "Animation" section.
-- **Dropdown**: We will implement a `QComboBox` populated with Manim entry effects (`GrowFromCenter`, `SpinInFromNothing`, `FadeIn`, `Create`, `Write`).
-- **AST Mutation**: When the user selects a new effect, `ASTMutator.update_animation_type()` will search for the `self.play(<OldEffect>(target))` AST node and dynamically overwrite the `<OldEffect>` identifier with the new selected string.
-
-### 3. Animation Timing (`run_time`)
-- **GUI Addition**: Inside the new Animation section, we will add a `run_time` slider (0.1 to 5.0 seconds).
-- **AST Mutation**: When dragged, `ASTMutator.update_animation_kwarg()` will target the `self.play(...)` statement and surgically update the `run_time` argument.
+This plan breaks down the 5-milestone analysis into exact file-by-file tasks.
 
 ## User Review Required
 
-This is a deep architectural upgrade that requires scanning across multiple lines of code to correlate an object with its animation.
+> [!IMPORTANT]
+> The biggest shift here is moving object identity away from simple `(variable_name, line_number)` to a robust `ObjectRegistry`. This will fundamentally change how `main.py` registers objects after the first render, and how `drag_controller.py` and `property_panel.py` look up objects. Please confirm this architectural direction before I start coding.
 
-**Do you approve this plan to begin coding Phase 6.2?**
+## Proposed Changes
+
+### Milestone 1: Stable Identity & Object Registry
+
+Currently, object identification relies on `_bisync_line_number` and variable names, which breaks down during complex AST re-parsing or for deep sub-mobjects (like `axes[0]`).
+
+#### [NEW] `engine/object_registry.py`
+- Create `LiveObjectRef` and `SelectionRef` dataclasses.
+- Implement an `ObjectRegistry` class to manage a stable mapping between python `id(mob)`, AST bindings, and hierarchical paths (e.g., `parent_id`, `sub_index`).
+
+#### [MODIFY] `main.py`
+- After `scene.render()` (or equivalent initialization), traverse the entire scene tree (top-level mobjects and all `submobjects`).
+- Register every rendered mobject into the `ObjectRegistry`.
+
+#### [MODIFY] `engine/drag_controller.py` & `engine/hit_tester.py`
+- Replace string-based variable name lookup with queries to the new `ObjectRegistry`.
+- Separate the "display name" (shown in UI) from the "canonical binding" (used for AST surgery).
+
+---
+
+### Milestone 2: Property Inspector & Data-Driven Panel
+
+Property discovery is currently mixed into the UI code (`property_panel.py`). It needs to be extracted into a dedicated logic layer.
+
+#### [NEW] `engine/property_inspector.py`
+- Create a `PropertyInspector` class to merge AST values + Live Object values + Defaults.
+- Return a list of `PropertySpec` objects (name, value, type, source, widget_hint, range_hint, read_only).
+- **Source priority:** Explicit AST > Modifier Call > Getter/Setter Pair > Safe Public Attr > Constructor Default.
+
+#### [MODIFY] `engine/property_panel.py`
+- Strip out discovery logic (`_introspect_live_mobject`, etc.).
+- Make it a "dumb renderer" (a pure View) that simply takes `PropertySpec` objects from the `PropertyInspector` and instantiates the correct widget (Slider, String Input, Checkbox, Color Picker).
+- Use `range_hint` provided by the inspector instead of hardcoded `_RANGE_HINTS`.
+
+---
+
+### Milestone 3: Generic AST Modifier Tracking
+
+Currently, `ASTMutator` only looks at constructor arguments (`var = Circle(radius=1)`). It ignores chained or separate modifier calls.
+
+#### [MODIFY] `engine/ast_mutator.py`
+- Extend the visitor to track method calls on known variables *after* assignment.
+- Capture modifier calls like `.move_to()`, `.shift()`, `.scale()`, `.rotate()`, `.set_color()`.
+- Store these as generic modifier references attached to the main `ASTNodeRef`.
+- Ensure complex expressions (e.g., `lambda x: ...`) are preserved as source code strings rather than overwritten with `None`.
+
+---
+
+### Milestone 4: Generic Hot-Apply Adapters
+
+Currently, `hot_swap.py` tries to set properties directly or via hardcoded names. It needs a generic pipeline.
+
+#### [MODIFY] `engine/hot_swap.py`
+- Implement an `apply_strategy` pipeline:
+  1. Try exact setter method (`set_radius` for `radius`).
+  2. Try direct attribute assignment (`mob.radius = value`).
+  3. Try `mob.generate_target()` / `MoveToTarget` logic for complex updates.
+- If a property cannot be hot-applied seamlessly, flag it so the engine knows to fall back to a full AST save + scene reload.
+
+#### [MODIFY] `engine/state.py`
+- Standardize the fallback pipeline. If HotSwap returns `False`, automatically queue an atomic file save and trigger the SceneFileWatcher.
+
+---
+
+### Milestone 5: Validation Matrix
+
+Once the core is built, validate against the following scenarios:
+1. Basic Shapes: `Circle`, `Square`
+2. Function Graphs: `axes.plot(lambda x: ...)`
+3. Text: `Text`, `MathTex`
+4. Groups: `VGroup` (applying properties to children recursively)
+5. Custom Subclassed Mobjects.
+6. A basic 3D Scene to ensure the registry handles `ThreeDScene` objects without crashing.
+
+## Verification Plan
+We will implement this milestone by milestone. After Milestone 1, we will verify that clicking objects on the canvas correctly logs their canonical identity from the new `ObjectRegistry` without relying on string matching.

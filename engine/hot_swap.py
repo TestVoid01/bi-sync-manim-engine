@@ -148,8 +148,11 @@ class HotSwapInjector:
 
             # Step 5: Extract parameters and apply to existing scene
             if added_mobjects:
-                self._apply_updates(added_mobjects)
-                self._engine_state.scene_is_healthy = True
+                update_ok = self._apply_updates(added_mobjects)
+                # Only mark healthy AFTER we verify updates applied
+                self._engine_state.scene_is_healthy = update_ok
+                if not update_ok:
+                    logger.warning("Hot-swap _apply_updates reported partial/no matches")
             else:
                 logger.warning("No mobjects found in reloaded scene")
                 self._engine_state.scene_is_healthy = False
@@ -169,20 +172,24 @@ class HotSwapInjector:
             )
             return False
 
-    def _apply_updates(self, new_mobjects: list) -> None:
+    def _apply_updates(self, new_mobjects: list) -> bool:
         """Apply parameters from new mobjects to existing scene mobjects.
 
         Matches by _bisync_line_number to be robust against array shifts,
         falling back to class type and order for unmatched objects.
+
+        Returns:
+            True if at least one mobject was successfully matched and updated.
         """
         if self._current_scene is None:
-            return
+            return False
 
         existing = list(self._current_scene.mobjects)
+        matched_count = 0
 
         # Try matching by line number first (robust against reordering)
         unmatched_new = []
-        matched_old_ids = set()
+        matched_old_ids: set[int] = set()
 
         for new_mob in new_mobjects:
             new_line = getattr(new_mob, '_bisync_line_number', None)
@@ -195,13 +202,14 @@ class HotSwapInjector:
                     if getattr(old_mob, '_bisync_line_number', None) == new_line and type(old_mob) == type(new_mob):
                         self._copy_properties(old_mob, new_mob)
                         matched_old_ids.add(id(old_mob))
+                        matched_count += 1
                         matched = True
                         break
 
             if not matched:
                 unmatched_new.append(new_mob)
 
-        # Fallback to type and index matching
+        # Fallback to type and index matching for objects without line numbers
         if unmatched_new:
             unmatched_old = [mob for mob in existing if id(mob) not in matched_old_ids]
 
@@ -218,6 +226,9 @@ class HotSwapInjector:
                 for i, new_mob in enumerate(new_list):
                     if i < len(old_list):
                         self._copy_properties(old_list[i], new_mob)
+                        matched_count += 1
+
+        return matched_count > 0
 
     def _copy_properties(self, old_mob: Any, new_mob: Any) -> None:
         """Copy visual properties from new mobject to old mobject.
@@ -276,12 +287,12 @@ class HotSwapInjector:
                                     setattr(old_mob, attr_name, new_val)
                             elif new_val != old_val:
                                 setattr(old_mob, attr_name, new_val)
-                                logger.debug(f"Reflection copied {attr_name}={new_val}")
+                                pass
                     except Exception:
                         pass
 
         except Exception as e:
-            logger.debug(f"Property copy error: {e}")
+            pass
 
     def apply_transform(self, target_var: str, method_name: str, value: float) -> bool:
         """Apply a transform method (like scale) directly to the mobject.
@@ -316,30 +327,64 @@ class HotSwapInjector:
         if self._current_scene is None:
             return False
 
-        # Find the mobject by variable name convention
-        # We look for mobjects that match the expected type/position
-        for mob in self._current_scene.mobjects:
-            if self._ast_mutator is not None:
-                live_bind = self._ast_mutator.get_live_bind(id(mob))
-                if live_bind and live_bind.variable_name == target_var:
-                    return self._apply_property_to_mob(mob, prop_name, new_value)
-                    
-            mob_type = type(mob).__name__
-
-            # Match by naming convention
-            if target_var == "circle" and mob_type == "Circle":
-                return self._apply_property_to_mob(mob, prop_name, new_value)
-            elif target_var == "square" and mob_type == "Square":
-                return self._apply_property_to_mob(mob, prop_name, new_value)
-            elif target_var == "triangle" and mob_type == "Triangle":
-                return self._apply_property_to_mob(mob, prop_name, new_value)
-            elif target_var == "dot" and mob_type == "Dot":
-                return self._apply_property_to_mob(mob, prop_name, new_value)
-            elif target_var == "title" and mob_type == "Text":
-                return self._apply_property_to_mob(mob, prop_name, new_value)
+        mob = self._find_mobject_by_variable(target_var)
+        if mob is not None:
+            return self._apply_property_to_mob(mob, prop_name, new_value)
 
         logger.warning(f"Mobject not found for: {target_var}")
         return False
+
+    def _find_mobject_by_variable(self, target_var: str) -> Any:
+        """Find a live scene mobject by its variable name.
+
+        Resolution order (most reliable first):
+        1. ObjectRegistry lookup (if available)
+        2. AST live_binds lookup
+        3. _bisync_line_number matching via AST bindings
+        4. Submobject walk (for deeply nested objects)
+
+        Returns the live mobject or None.
+        """
+        if self._current_scene is None:
+            return None
+
+        # Strategy 1: ObjectRegistry (canonical, most reliable)
+        registry = getattr(self._engine_state, "object_registry", None)
+        if registry is not None:
+            live_ref = registry.get_by_variable_name(target_var)
+            if live_ref is not None:
+                found = registry.find_mobject(self._current_scene, live_ref.mobject_id)
+                if found is not None:
+                    return found
+
+        # Strategy 2: AST live_binds (mobject_id → variable mapping)
+        if self._ast_mutator is not None:
+            for mob in self._current_scene.mobjects:
+                live_bind = self._ast_mutator.get_live_bind(id(mob))
+                if live_bind is not None and live_bind.variable_name == target_var:
+                    return mob
+
+        # Strategy 3: Match via _bisync_line_number from AST bindings
+        if self._ast_mutator is not None:
+            binding = self._ast_mutator.get_binding_by_name(target_var)
+            if binding is not None:
+                target_line = binding.line_number
+                for mob in self._current_scene.mobjects:
+                    if getattr(mob, '_bisync_line_number', None) == target_line:
+                        return mob
+
+        # Strategy 4: Walk all mobjects including submobjects
+        if self._ast_mutator is not None:
+            for mob in self._current_scene.mobjects:
+                live_bind = self._ast_mutator.get_live_bind(id(mob))
+                if live_bind is not None and live_bind.variable_name == target_var:
+                    return mob
+                for sub in getattr(mob, 'submobjects', []):
+                    sub_bind = self._ast_mutator.get_live_bind(id(sub))
+                    if sub_bind is not None and sub_bind.variable_name == target_var:
+                        return sub
+
+        return None
 
     def _apply_property_to_mob(
         self, mob: Any, prop_name: str, value: Any
@@ -351,20 +396,20 @@ class HotSwapInjector:
                 current_radius = mob.width / 2.0
                 if current_radius > 0 and abs(value - current_radius) > 1e-6:
                     mob.scale(value / current_radius)
-                    logger.debug(f"Applied radius={value}")
+                    pass
                     return True
 
             elif prop_name == "side_length" and hasattr(mob, 'width'):
                 current_side = mob.width
                 if current_side > 0 and abs(value - current_side) > 1e-6:
                     mob.scale(value / current_side)
-                    logger.debug(f"Applied side_length={value}")
+                    pass
                     return True
 
             elif prop_name == "fill_opacity":
                 if hasattr(mob, 'set_fill'):
                     mob.set_fill(opacity=value)
-                    logger.debug(f"Applied fill_opacity={value}")
+                    pass
                     return True
 
             elif prop_name == "stroke_width":
@@ -393,7 +438,6 @@ class HotSwapInjector:
                     
             elif prop_name == "text":
                 # Changing text requires full reload usually, but we can try to update it
-                # if the mobject supports it, otherwise it'll just trigger a reload on release
                 if hasattr(mob, 'text'):
                     mob.text = value
                     return True
@@ -412,13 +456,13 @@ class HotSwapInjector:
                     setter = getattr(mob, setter_name)
                     if callable(setter):
                         setter(value)
-                        logger.debug(f"Applied generic {prop_name}={value} via {setter_name}()")
+                        pass
                         return True
                 
                 # Second attempt: Direct attribute setting (setattr)
                 if hasattr(mob, prop_name):
                     setattr(mob, prop_name, value)
-                    logger.debug(f"Applied generic {prop_name}={value} via setattr")
+                    pass
                     return True
 
         except Exception as e:
@@ -448,7 +492,7 @@ class HotSwapInjector:
                     cls._COLOR_MAP[name] = obj
                 elif type(obj).__name__ == 'ManimColor' or hasattr(obj, 'to_hex'):  # ManimColor
                     cls._COLOR_MAP[name] = obj
-            logger.debug(f"Color map built: {len(cls._COLOR_MAP)} entries")
+            pass
 
         return cls._COLOR_MAP.get(color_name)
 
@@ -468,7 +512,7 @@ class HotSwapInjector:
 
             if hasattr(mob, 'set_color'):
                 mob.set_color(color_value)
-                logger.debug(f"Applied color={color_value}")
+                pass
                 return True
         except Exception as e:
             logger.error(f"Color apply error: {e}")

@@ -21,6 +21,7 @@ Safety:
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -58,6 +59,7 @@ class SceneFileWatcher:
         self._debounce_timer.setSingleShot(True)
         self._debounce_timer.setInterval(300)  # 300ms debounce
         self._debounce_timer.timeout.connect(self._do_reload)
+        self._suppress_reload_until: float = 0.0
 
         # Connect watcher signal
         self._watcher.fileChanged.connect(self._on_change_detected)
@@ -95,10 +97,13 @@ class SceneFileWatcher:
         """
         # Check Socket 5: are we paused?
         if self._engine_state.is_file_watcher_paused:
-            logger.debug("File changed but watcher is PAUSED (Socket 5)")
+            pass
             return
 
-        logger.debug(f"Change detected: {Path(path).name} (debouncing...)")
+        if time.monotonic() < self._suppress_reload_until:
+            return
+
+        pass
         self._debounce_timer.start()  # Restart the timer
 
         # QFileSystemWatcher sometimes drops the watch after a change
@@ -116,12 +121,19 @@ class SceneFileWatcher:
         """Socket 5: Pause the watcher during slider drag."""
         self._engine_state.pause_file_watcher()
         self._debounce_timer.stop()
-        logger.debug("File watcher PAUSED")
+        pass
 
     def resume(self) -> None:
         """Socket 5: Resume the watcher after slider release."""
         self._engine_state.resume_file_watcher()
-        logger.debug("File watcher RESUMED")
+        pass
+
+    def notify_internal_commit(self, suppress_ms: int = 500) -> None:
+        """Suppress watcher-triggered reload briefly after internal save."""
+        self._suppress_reload_until = max(
+            self._suppress_reload_until,
+            time.monotonic() + (suppress_ms / 1000.0),
+        )
 
     def stop(self) -> None:
         """Stop watching entirely."""

@@ -49,7 +49,8 @@ class AnimationPlayer:
     PLAYING = "playing"
     PAUSED = "paused"
 
-    def __init__(self, fps: int = 60) -> None:
+    def __init__(self, engine_state: 'EngineState', fps: int = 60) -> None:
+        self._engine_state = engine_state
         self._fps = fps
         self._dt = 1.0 / fps
 
@@ -132,10 +133,10 @@ class AnimationPlayer:
         self._queue.append(entry)
         self._original_queue.append(entry)
 
-        logger.debug(
-            f"Captured animation: {[type(a).__name__ for a in anim_list]} "
-            f"(run_time={run_time:.1f}s)"
-        )
+        pass
+
+
+
 
     # ────────────────────────────────────────────────────────────
     # Playback Controls
@@ -222,6 +223,7 @@ class AnimationPlayer:
             self._interpolate_all(self._current_alpha)
 
         self._emit_progress_changed()
+        self._engine_state.request_render()
 
     def _interpolate_all(self, alpha: float) -> None:
         """Apply interpolation to all current animations."""
@@ -309,6 +311,7 @@ class AnimationPlayer:
         self._interpolate_all(self._current_alpha)
         
         self._emit_progress_changed()
+        self._engine_state.request_render()
         
     def _emit_state_changed(self) -> None:
         if self._on_state_changed:

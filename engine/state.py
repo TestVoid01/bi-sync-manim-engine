@@ -18,8 +18,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from engine.object_registry import ObjectRegistry
+
 if TYPE_CHECKING:
     from engine.ast_mutator import ASTAnimationRef
+    from engine.object_registry import SelectionRef
 
 logger = logging.getLogger("bisync.state")
 
@@ -38,6 +41,23 @@ class EngineState:
         - File writes are handled directly by ASTMutator.save_atomic()
           (no SSD debounce infrastructure needed).
     """
+
+    # Render lifecycle states used by MainWindow transition flow.
+    RENDER_READY = "ready"
+    RENDER_LOADING = "loading"
+    RENDER_UNHEALTHY = "unhealthy"
+
+    # Session State Machine
+    STATE_IDLE = "idle"
+    STATE_PREVIEWING = "previewing"
+    STATE_COMMIT_PENDING = "commit_pending"
+    STATE_COMMITTING = "committing"
+    STATE_SETTLED = "settled"
+
+    # Reload Governor Policies
+    RELOAD_ALLOW_FULL = "allow_full"
+    RELOAD_PREFER_PROPERTY_ONLY = "prefer_property_only"
+    RELOAD_BLOCK_DURING_BURST = "block_during_burst"
 
     def __init__(self) -> None:
         # ── Socket 1: Scene Parsed Event ──
@@ -63,11 +83,18 @@ class EngineState:
 
         # ── Scene Health (Black Screen Trap Prevention) ──
         self.scene_is_healthy: bool = True
+        self.render_state: str = self.RENDER_READY
+        self.interaction_burst_active: bool = False
+        self.interaction_session_state: str = self.STATE_IDLE
+        self.reload_guard_mode: str = self.RELOAD_ALLOW_FULL
+        self._interaction_state_callbacks: list[Callable[[str], None]] = []
 
         # ── Phase 5: Selected Animation for Visual Editing ──
         self.selected_animation: Optional[ASTAnimationRef] = None
 
         # ── Phase 6: Deep Graphical Control (Selection Tracking) ──
+        self.object_registry = ObjectRegistry()
+        self._selected_object: Optional["SelectionRef"] = None
         self._selected_mobject_name: Optional[str] = None
         self._selection_callbacks: list[Callable[[Optional[str]], None]] = []
         
@@ -88,7 +115,7 @@ class EngineState:
         variable→Mobject mapping table.
         """
         self._scene_parsed_callbacks.append(callback)
-        logger.debug(f"Registered scene_parsed callback: {callback.__name__}")
+        pass
 
     def emit_scene_parsed(self) -> None:
         """Fire all scene_parsed callbacks. Called after Scene.construct()."""
@@ -133,7 +160,7 @@ class EngineState:
     def set_render_callback(self, callback: Callable[[float], None]) -> None:
         """Set the render trigger. ManimCanvas sets this to self.update()."""
         self._render_callback = callback
-        logger.debug("Render callback registered")
+        pass
 
     def request_render(self, dt: float = 0.0) -> None:
         """Request a new frame. Phase 2 calls this after code hot-swap."""
@@ -156,12 +183,12 @@ class EngineState:
         slider → file write → watcher → reload → slider → ∞
         """
         self._file_watcher_paused = True
-        logger.debug("File watcher PAUSED")
+        pass
 
     def resume_file_watcher(self) -> None:
         """Resume QFileSystemWatcher after drag/slider release."""
         self._file_watcher_paused = False
-        logger.debug("File watcher RESUMED")
+        pass
 
     @property
     def is_file_watcher_paused(self) -> bool:
@@ -171,7 +198,7 @@ class EngineState:
     def set_file_watcher(self, watcher: Any) -> None:
         """Register the file watcher instance for Socket 5 control."""
         self._file_watcher = watcher
-        logger.debug("File watcher registered with EngineState")
+        pass
 
     # ────────────────────────────────────────────────────────────
     # GUI State Reconciliation
@@ -193,9 +220,51 @@ class EngineState:
             except Exception as e:
                 logger.error(f"GUI update callback failed: {e}")
 
+    def on_interaction_state_changed(self, callback: Callable[[str], None]) -> None:
+        self._interaction_state_callbacks.append(callback)
+
+    def set_interaction_state(self, state: str) -> None:
+        if self.interaction_session_state == state:
+            return
+        self.interaction_session_state = state
+        for cb in self._interaction_state_callbacks:
+            try:
+                cb(state)
+            except Exception as e:
+                logger.error(f"Interaction state callback failed: {e}")
+
+    # ────────────────────────────────────────────────────────────
+    # Scene transition state
+    # ────────────────────────────────────────────────────────────
+
+    def mark_scene_transition(self, render_state: Optional[str] = None) -> None:
+        """Mark scene as transitioning/reloading."""
+        self.scene_is_healthy = False
+        self.render_state = render_state or self.RENDER_LOADING
+
+    def mark_scene_unhealthy(self) -> None:
+        """Mark scene as unhealthy after reload/render failure."""
+        self.scene_is_healthy = False
+        self.render_state = self.RENDER_UNHEALTHY
+
+    def mark_scene_ready(self) -> None:
+        """Mark scene as healthy and fully ready."""
+        self.scene_is_healthy = True
+        self.render_state = self.RENDER_READY
+
     # ────────────────────────────────────────────────────────────
     # Phase 6: Selection State Control
     # ────────────────────────────────────────────────────────────
+
+    @property
+    def selected_object(self) -> Optional["SelectionRef"]:
+        return self._selected_object
+
+    def set_selected_object(self, selection: Optional["SelectionRef"]) -> None:
+        """Set canonical object selection payload and emit legacy name signal."""
+        self._selected_object = selection
+        name = selection.display_name if selection is not None else None
+        self.set_selected_mobject_name(name)
 
     @property
     def selected_mobject_name(self) -> Optional[str]:
@@ -205,7 +274,7 @@ class EngineState:
         """Set the currently selected mobject by variable name and emit."""
         if self._selected_mobject_name != name:
             self._selected_mobject_name = name
-            logger.debug(f"Selection changed: {name}")
+            pass
             for cb in self._selection_callbacks:
                 try:
                     cb(name)

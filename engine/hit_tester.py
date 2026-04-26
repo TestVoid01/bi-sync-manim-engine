@@ -68,9 +68,9 @@ class HitTester:
                     best_id = mob_id
 
         if best_id is not None:
-            logger.debug(
-                f"Hit: mobject {best_id} at ({math_x:.2f}, {math_y:.2f})"
-            )
+            pass
+
+
 
         return best_id
 
@@ -114,13 +114,13 @@ class HitTester:
 
     def get_ast_ref(self, mobject: Any) -> Optional[ASTNodeRef]:
         if not hasattr(mobject, "_bisync_line_number"):
-            logger.debug(f"mobject {type(mobject).__name__} has no _bisync_line_number")
+            pass
             return None
             
         line_num = mobject._bisync_line_number
         ref = self._ast_mutator.bindings.get(line_num)
         if ref is None:
-            logger.debug(f"Line {line_num} not found in bindings dict. Keys: {list(self._ast_mutator.bindings.keys())}")
+            pass
         return ref
 
     def get_variable_name(self, mobject: Any) -> Optional[str]:

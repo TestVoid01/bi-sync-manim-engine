@@ -185,7 +185,7 @@ class ManimCanvas(QOpenGLWidget):
                                 self._scene.add(ghost_mob)
                                 ghost_added = True
                             except Exception as e:
-                                logger.debug(f"Ghost apply error: {e}")
+                                pass
                 
                 self._renderer.update_frame(self._scene)
                 
@@ -202,7 +202,7 @@ class ManimCanvas(QOpenGLWidget):
         """
         if self._ctx is not None:
             self._ctx.viewport = (0, 0, width, height)
-            logger.debug(f"Viewport resized to {width}x{height}")
+            pass
 
         # Update coordinate transformer with new widget dimensions
         if self._coord_transformer is not None:
@@ -428,6 +428,50 @@ class ManimCanvas(QOpenGLWidget):
         """Return the ModernGL context (or None if not initialized)."""
         return self._ctx
 
+    def request_render_validation(
+        self,
+        priming_frames: int = 1,
+        health_checks: int = 1,
+    ) -> None:
+        """Compatibility hook for MainWindow post-reload validation.
+
+        Older MainWindow flows call this after scene wiring to "prime" a few
+        frames. In this build we can safely schedule those repaints directly.
+        """
+        del health_checks
+        frame_count = max(1, int(priming_frames))
+        for _ in range(frame_count):
+            self.update()
+
+    def shadow_validate_scene_source(
+        self,
+        source_text: str,
+        module_name: str,
+        scene_file: str,
+    ) -> tuple[bool, str]:
+        """Validate candidate scene code without mutating live preview."""
+        try:
+            import ast as ast_mod
+            from manim import Scene as BaseScene
+
+            ast_mod.parse(source_text)
+
+            compiled = compile(source_text, scene_file, "exec")
+            ns: dict[str, Any] = {}
+            exec("from manim import *", ns)
+            exec(compiled, ns)
+
+            has_scene = any(
+                isinstance(obj, type) and issubclass(obj, BaseScene) and obj is not BaseScene
+                for obj in ns.values()
+            )
+            if not has_scene:
+                return False, f"no Scene subclass found in {module_name}"
+
+            return True, "shadow validation passed"
+        except Exception as exc:
+            return False, str(exc)
+
     def reload_scene_from_module(self, module_name: str, scene_file: str) -> bool:
         """Full scene reload — destroys old scene, creates fresh one.
 
@@ -463,9 +507,22 @@ class ManimCanvas(QOpenGLWidget):
             # otherwise Manim's init_scene will lose track of the FBO.
             self.makeCurrent()
             
-            # Step 0: Clean up old state
+            # Step 0: Clean up old state comprehensively
             self._engine_state.clear_hitboxes()
             self._engine_state.selected_animation = None
+            self._engine_state.set_selected_object(None)
+
+            # Clear object registry to prevent ghost references
+            if hasattr(self._engine_state, 'object_registry'):
+                self._engine_state.object_registry.clear()
+
+            # Clear AST live_binds so stale mobject_id mappings don't persist
+            if hasattr(self, '_ast_mutator') and self._ast_mutator is not None:
+                clear_fn = getattr(self._ast_mutator, 'clear_live_binds', None)
+                if callable(clear_fn):
+                    clear_fn()
+                elif hasattr(self._ast_mutator, '_live_binds'):
+                    self._ast_mutator._live_binds.clear()
             
             # Step 1: Reload the Python module
             if module_name in sys.modules:

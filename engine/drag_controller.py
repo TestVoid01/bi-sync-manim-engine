@@ -92,7 +92,7 @@ class DragController:
         self._drag_timer.setInterval(16)  # ~60fps
         self._drag_timer.timeout.connect(self._process_pending_drag)
 
-        logger.info("DragController initialized")
+        pass
 
     def set_scene(self, scene: Any) -> None:
         """Set the active scene for mobject lookup."""
@@ -188,6 +188,7 @@ class DragController:
         # Hit-test against Socket 2 AABB hitboxes
         mob_id = self._hit_tester.test(math_x, math_y)
         if mob_id is None:
+            self._engine_state.set_selected_object(None)
             self._engine_state.set_selected_mobject_name(None)
             return False
 
@@ -208,14 +209,19 @@ class DragController:
             mob = top_level_mob
             selected_path = []
 
-        # Get variable name and line number for AST updates
+        # Get variable name and line number for AST updates.
+        # Do not block selection if source provenance is missing:
+        # users should still be able to select/drag in live preview.
         ast_ref = self._hit_tester.get_ast_ref(top_level_mob)
-        if ast_ref is None:
-            logger.debug(f"No AST mapping for {type(top_level_mob).__name__}, skipping drag")
-            return False
-
-        var_name = ast_ref.variable_name
-        line_num = ast_ref.line_number
+        if ast_ref is not None:
+            var_name = ast_ref.variable_name
+            line_num = ast_ref.line_number
+        else:
+            live_ref = self._ast_mutator.get_live_bind(id(top_level_mob))
+            if live_ref is None and mob is not top_level_mob:
+                live_ref = self._ast_mutator.get_live_bind(id(mob))
+            var_name = live_ref.variable_name if live_ref is not None else None
+            line_num = live_ref.line_number if live_ref is not None else None
 
         # Calculate drag offset (click position relative to object center)
         center = mob.get_center()
@@ -231,9 +237,22 @@ class DragController:
         self._selected_mob_line_num = line_num
         self._selected_mob_path = selected_path
         
-        # Display name could show path, e.g. axes[0][1]
-        display_name = var_name + "".join(f"[{i}]" for i in selected_path)
-        self._engine_state.set_selected_mobject_name(display_name)
+        # Display name could show path, e.g. axes[0][1].
+        # Fall back to runtime type for objects without source binding.
+        base_name = var_name or type(mob).__name__
+        display_name = base_name + "".join(f"[{i}]" for i in selected_path)
+        selection = None
+        object_registry = getattr(self._engine_state, "object_registry", None)
+        if object_registry is not None:
+            selection = object_registry.create_selection(
+                top_level_mobject_id=id(top_level_mob),
+                selected_mobject_id=id(mob),
+                path=tuple(selected_path),
+            )
+        if selection is not None:
+            self._engine_state.set_selected_object(selection)
+        else:
+            self._engine_state.set_selected_mobject_name(display_name)
 
         # Pause file watcher (Socket 5)
         if self._file_watcher:
@@ -541,3 +560,18 @@ class DragController:
     def selected_variable(self) -> Optional[str]:
         """Get the variable name of the currently selected object."""
         return self._selected_var_name
+
+    def commit_active_drag(self) -> bool:
+        """Finalize any active drag before export.
+
+        Returns:
+            True when no drag is active or commit succeeds.
+        """
+        if not self._dragging:
+            return True
+        try:
+            self.on_mouse_release(0, 0)
+            return not self._dragging
+        except Exception as e:
+            logger.error(f"Failed to commit active drag: {e}")
+            return False

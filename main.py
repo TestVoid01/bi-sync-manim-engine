@@ -19,9 +19,13 @@ What should happen:
 
 from __future__ import annotations
 
+import copy
 import logging
 import sys
 import os
+import tempfile
+from pathlib import Path
+from typing import Any, Optional
 
 # ── Configure Manim BEFORE any Manim imports ──
 # This MUST happen before importing Scene, Circle, etc.
@@ -77,41 +81,12 @@ def _patch_manim_earcut():
 _patch_manim_earcut()
 
 # ── Monkey-patch Mobject to track creation line numbers ──
-from manim.mobject.mobject import Mobject
-from manim.mobject.opengl.opengl_mobject import OpenGLMobject
+from engine.runtime_provenance import (
+    configure_tracking as configure_runtime_tracking,
+    patch_manim_creation_tracking,
+)
 
-_orig_mobject_init = Mobject.__init__
-_orig_opengl_mobject_init = OpenGLMobject.__init__
-
-def _patched_mobject_init(self, *args, **kwargs):
-    _orig_mobject_init(self, *args, **kwargs)
-    try:
-        frame = sys._getframe(1)
-        while frame:
-            # Check if this frame is from a user's scene file
-            filename = frame.f_code.co_filename
-            if "scenes" in filename and filename.endswith(".py"):
-                self._bisync_line_number = frame.f_lineno
-                break
-            frame = frame.f_back
-    except Exception:
-        pass
-
-def _patched_opengl_mobject_init(self, *args, **kwargs):
-    _orig_opengl_mobject_init(self, *args, **kwargs)
-    try:
-        frame = sys._getframe(1)
-        while frame:
-            filename = frame.f_code.co_filename
-            if "scenes" in filename and filename.endswith(".py"):
-                self._bisync_line_number = frame.f_lineno
-                break
-            frame = frame.f_back
-    except Exception:
-        pass
-
-Mobject.__init__ = _patched_mobject_init
-OpenGLMobject.__init__ = _patched_opengl_mobject_init
+patch_manim_creation_tracking()
 
 
 # ── Now safe to import everything else ──
@@ -142,9 +117,10 @@ from engine.property_panel import PropertyPanel
 from engine.coordinate_transformer import CoordinateTransformer
 from engine.hit_tester import HitTester
 from engine.drag_controller import DragController
-from engine.code_editor import CodeEditorPanel
+from engine.code_editor import CodeEditorPanel, ShadowBuildResult
 from engine.animation_player import AnimationPlayer
 from engine.export_dialog import ExportDialog, ExportWorker
+from engine.scene_sync import decide_scene_sync
 from scenes.advanced_scene import AdvancedScene
 
 # ── Logging ──
@@ -236,7 +212,12 @@ class MainWindow(QMainWindow):
         scene_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), self.SCENE_FILE
         )
+        configure_runtime_tracking(
+            scene_path,
+            project_root=Path(os.path.dirname(os.path.abspath(__file__))),
+        )
         self.ast_mutator.parse_file(scene_path)
+        self._normalize_scene_source_if_needed(scene_path)
 
         # ── Coordinate Transformer (Phase 4) ──
         self.coord_transformer = CoordinateTransformer()
@@ -251,7 +232,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(0)
 
         # ── Animation Player ──
-        self.animation_player = AnimationPlayer(fps=60)
+        self.animation_player = AnimationPlayer(self.engine_state, fps=60)
 
         # ── Manim Canvas ──
         self.canvas = ManimCanvas(
@@ -301,11 +282,18 @@ class MainWindow(QMainWindow):
 
         # Wire transform drag to full reload
         self.property_panel.transform_drag_requested.connect(self._on_transform_drag_requested)
+        self.property_panel.full_reload_requested.connect(
+            self._on_property_panel_full_reload_requested
+        )
         self._transform_drag_timer = QTimer()
         self._transform_drag_timer.setSingleShot(True)
         self._transform_drag_timer.setInterval(200) # 200ms debounce
         self._transform_drag_timer.timeout.connect(self._execute_debounced_transform_reload)
         self._pending_transform: Optional[tuple[str, str, float]] = None
+        self._pending_scene_ready_status: Optional[str] = None
+        self._pending_scene_ready_sync_properties: bool = False
+        self._pending_selection_rebind: Optional[tuple[str, tuple[int, ...]]] = None
+        self._deferred_full_reload_path: Optional[str] = None
 
         # ── Code Editor (Left Dock) ──
         self.code_editor = CodeEditorPanel(
@@ -319,6 +307,7 @@ class MainWindow(QMainWindow):
         # ── State Reconciliation: sync BOTH sliders AND code editor ──
         self.engine_state.on_gui_update(self.property_panel.sync_from_code)
         self.engine_state.on_gui_update(self.code_editor.sync_from_file)
+        self.engine_state.on_interaction_state_changed(self._on_interaction_state_changed)
 
         # ── Wire Code Editor → Full Reload Pipeline ──
         # When user types code → save → THIS triggers AST + hot-swap + sliders
@@ -330,9 +319,7 @@ class MainWindow(QMainWindow):
         # ── Status Bar ──
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage(
-            "Bi-Sync Active | Code Editor | Canvas | Animations | Drag & Drop"
-        )
+        self.status_bar.showMessage("Loading scene...")
 
         # Wire hot-swap + drag to canvas (deferred until canvas initializes)
         self._scene_path = scene_path
@@ -347,115 +334,364 @@ class MainWindow(QMainWindow):
         """
         scene = self.canvas.get_scene()
         if scene is not None:
-            self.hot_swap.set_scene(scene, self._scene_path)
-            self.drag_controller.set_scene(scene)
-            self.animation_player.set_scene(scene)
-
-            # Update coord transformer with initial widget size
-            self.coord_transformer.set_widget_size(
-                self.canvas.width(), self.canvas.height()
+            status_message = self._pending_scene_ready_status
+            sync_properties = self._pending_scene_ready_sync_properties
+            self._pending_scene_ready_status = None
+            self._pending_scene_ready_sync_properties = False
+            self._finalize_scene_ready(
+                scene,
+                status_message=status_message,
+                sync_property_panel=sync_properties,
             )
 
-            # Update status bar with animation count
-            anim_count = self.animation_player.animation_count
-            self.status_bar.showMessage(
-                f"Bi-Sync Active | {anim_count} animations captured | "
-                f"Press ▶ Play to animate"
-            )
-
-            logger.info(
-                f"All controllers connected. "
-                f"{anim_count} animations ready."
+    def _begin_scene_transition(
+        self,
+        *,
+        status_message: str,
+        render_state: Optional[str] = None,
+        reset_toolbar: bool = False,
+    ) -> None:
+        self.engine_state.mark_scene_transition(
+            render_state or self.engine_state.RENDER_LOADING
+        )
+        self.status_bar.showMessage(status_message)
+        if reset_toolbar:
+            self._sync_animation_toolbar(
+                state=self.animation_player.IDLE,
+                progress=0.0,
+                reset_selection=True,
+                force_progress_sync=True,
             )
 
     # Module name for importlib.reload
     SCENE_MODULE = "scenes.advanced_scene"
 
+    def _finalize_scene_ready(
+        self,
+        scene,
+        *,
+        status_message: Optional[str] = None,
+        sync_property_panel: bool = False,
+    ) -> None:
+        self.engine_state.mark_scene_ready()
+        self.hot_swap.set_scene(scene, self._scene_path)
+        self.engine_state.object_registry.register_scene(scene, self.ast_mutator)
+        self.drag_controller.set_scene(scene)
+        self.animation_player.set_scene(scene)
+
+        self.coord_transformer.set_widget_size(
+            self.canvas.width(), self.canvas.height()
+        )
+
+        selection_restored = self._restore_selection_after_reload(scene)
+        if sync_property_panel and not selection_restored:
+            self.property_panel.sync_from_code()
+
+        anim_count = self.animation_player.animation_count
+        if status_message is None:
+            status_message = (
+                f"Bi-Sync Active | {anim_count} animations captured | "
+                f"Press ▶ Play to animate"
+            )
+
+        self.status_bar.showMessage(status_message)
+        self._sync_animation_toolbar(
+            state=self.animation_player.IDLE,
+            progress=0.0,
+            reset_selection=True,
+            force_progress_sync=True,
+        )
+        self.canvas.request_render_validation(priming_frames=3, health_checks=4)
+
+        logger.info("All controllers connected. %d animations ready.", anim_count)
+
+    def _sync_animation_toolbar(
+        self,
+        *,
+        state: Optional[str] = None,
+        progress: Optional[float] = None,
+        reset_selection: bool = False,
+        force_progress_sync: bool = False,
+    ) -> None:
+        resolved_state = state or self.animation_player.state
+        resolved_progress = self.animation_player.progress if progress is None else progress
+        resolved_progress = max(0.0, min(1.0, resolved_progress))
+        count = self.animation_player.animation_count
+
+        if reset_selection:
+            self.engine_state.selected_animation = None
+
+        is_playing = resolved_state == self.animation_player.PLAYING
+        is_paused = resolved_state == self.animation_player.PAUSED
+
+        self._btn_play.setEnabled(not is_playing)
+        self._btn_pause.setEnabled(is_playing)
+
+        if force_progress_sync or not self._progress_slider.isSliderDown():
+            self._progress_slider.blockSignals(True)
+            self._progress_slider.setValue(int(resolved_progress * 1000))
+            self._progress_slider.blockSignals(False)
+
+        if is_playing:
+            self._btn_play.setText("▶  Playing...")
+            self._anim_label.setText("  ▶ Animating...")
+            return
+
+        if is_paused:
+            self._btn_play.setText("▶  Resume")
+            self._anim_label.setText("  ⏸ Paused")
+            return
+
+        self._btn_play.setText("▶  Play")
+        if count == 0:
+            self._anim_label.setText("  Ready (0 animations)")
+        elif resolved_progress >= 1.0:
+            self._anim_label.setText(f"  ✅ Complete ({count} animations)")
+        else:
+            self._anim_label.setText(f"  Ready ({count} animations)")
+
+    def _capture_selection_rebind(self) -> Optional[tuple[str, tuple[int, ...]]]:
+        selection = self.engine_state.selected_object
+        if selection is None or selection.source_key is None:
+            return None
+        return selection.source_key, tuple(selection.path)
+
+    def _restore_selection_after_reload(self, scene) -> bool:
+        token = self._pending_selection_rebind
+        self._pending_selection_rebind = None
+        if token is None or scene is None:
+            return False
+
+        source_key, path = token
+        source_ref = self.engine_state.object_registry.get_by_source_key(source_key)
+        if source_ref is None:
+            self.engine_state.set_selected_object(None)
+            return False
+
+        selected_mob = self.engine_state.object_registry.find_mobject(scene, source_ref.mobject_id)
+        if selected_mob is None:
+            selected_mob = self.engine_state.object_registry.find_mobject_by_source_key(scene, source_key)
+
+        if selected_mob is None:
+            self.engine_state.set_selected_object(None)
+            return False
+
+        selection = self.engine_state.object_registry.create_selection(
+            top_level_mobject_id=source_ref.top_level_id,
+            selected_mobject_id=id(selected_mob),
+            path=path if path else source_ref.path,
+        )
+        self.engine_state.set_selected_object(selection)
+        return selection is not None
+
     def _on_file_changed(self, path: str) -> None:
         """Called by file watcher when scene file changes externally.
 
         Smart detection:
-            - Compare old vs new AST bindings
-            - Same structure → property-only update (fast)
-            - Different structure → full scene reload (slow but complete)
+            - Compare old vs new AST metadata
+            - Safe visual-only changes → property-only update
+            - Layout/animation/code-semantic changes → full scene reload
         """
         logger.info(f"External file change detected: {os.path.basename(path)}")
+        if self.engine_state.interaction_burst_active:
+            self._deferred_full_reload_path = path
+            return
+        self._process_scene_file_update(path, sync_code_editor=True)
 
-        # Save old binding keys for comparison
-        old_binding_keys = set(self.ast_mutator.bindings.keys())
+    def _on_interaction_state_changed(self, state: str) -> None:
+        if state == "previewing":
+            self.status_bar.showMessage("Live Preview")
+        elif state == "commit_pending":
+            self.status_bar.showMessage("Live Preview (pending commit)")
+        elif state == "committing":
+            self.status_bar.showMessage("Committing edits...")
+        elif state == "settled":
+            self.status_bar.showMessage("Synced ✓")
+            if self._deferred_full_reload_path:
+                path = self._deferred_full_reload_path
+                self._deferred_full_reload_path = None
+                self._process_scene_file_update(path, sync_code_editor=True)
+        elif state == "read_only_target":
+            self.status_bar.showMessage("Read-only target")
+        elif state == "idle":
+            # Let existing workflow/status updates own final messaging.
+            pass
 
-        # Re-parse AST
-        self.ast_mutator.parse_file(path)
-        new_binding_keys = set(self.ast_mutator.bindings.keys())
+    def _on_code_editor_saved(self, source_text: str) -> ShadowBuildResult:
+        """Called when the editor wants to apply a validated draft."""
+        logger.info("Code Editor draft → shadow validating: %s", os.path.basename(self._scene_path))
 
-        # Detect structural change or recover from unhealthy state
-        if old_binding_keys != new_binding_keys or not self.engine_state.scene_is_healthy:
-            logger.info(
-                f"STRUCTURAL CHANGE detected: "
-                f"old={old_binding_keys}, new={new_binding_keys}, "
-                f"healthy={self.engine_state.scene_is_healthy}"
+        previous_source = Path(self._scene_path).read_text(encoding="utf-8")
+        ok, message = self._shadow_validate_editor_source(source_text)
+        if not ok:
+            logger.warning("Code Editor shadow build failed: %s", message)
+            return ShadowBuildResult(
+                applied=False,
+                status=f"Preview frozen — {message}",
+                error=message,
             )
-            self._do_full_reload(path)
-        else:
-            # Fast path: property-only update
-            self._do_property_update()
 
-        # Sync code editor (ghost-typing effect)
-        self.code_editor.sync_from_file()
-
-        self.engine_state.request_render()
-
-    def _on_code_editor_saved(self, path: str) -> None:
-        """Called when user types code in the editor and debounce saves.
-
-        Same smart detection as _on_file_changed.
-        Does NOT sync code editor back (prevents feedback loop).
-        """
-        logger.info(f"Code Editor save → reloading: {os.path.basename(path)}")
-
-        old_binding_keys = set(self.ast_mutator.bindings.keys())
-
-        self.ast_mutator.parse_file(path)
-        new_binding_keys = set(self.ast_mutator.bindings.keys())
-
-        # Detect structural change or recover from unhealthy state
-        if old_binding_keys != new_binding_keys or not self.engine_state.scene_is_healthy:
-            logger.info(
-                f"STRUCTURAL CHANGE from editor: "
-                f"old={old_binding_keys}, new={new_binding_keys}, "
-                f"healthy={self.engine_state.scene_is_healthy}"
+        if not self._write_source_atomic(self._scene_path, source_text):
+            return ShadowBuildResult(
+                applied=False,
+                status="Preview frozen — could not save draft",
+                error="atomic source write failed",
             )
-            self._do_full_reload(path)
+
+        if not self._process_scene_file_update(self._scene_path, sync_code_editor=False):
+            logger.error("Code Editor apply failed after disk write; restoring last good source")
+            self._write_source_atomic(self._scene_path, previous_source)
+            self.ast_mutator.parse_file(self._scene_path)
+            return ShadowBuildResult(
+                applied=False,
+                status="Preview frozen — reload failed, reverted to last good scene",
+                error="scene reload failed",
+            )
+
+        logger.info("Code change processed")
+        return ShadowBuildResult(
+            applied=True,
+            status="Preview updated from code",
+            applied_source=Path(self._scene_path).read_text(encoding="utf-8"),
+        )
+
+    def _snapshot_ast_state(self) -> tuple[dict[str, Any], list[Any]]:
+        bindings = {
+            ref.variable_name: copy.deepcopy(ref)
+            for ref in self.ast_mutator.iter_scene_nodes()
+        }
+        animations = copy.deepcopy(self.ast_mutator.animations)
+        return bindings, animations
+
+    def _shadow_validate_editor_source(self, source_text: str) -> tuple[bool, str]:
+        try:
+            shadow_mutator = ASTMutator()
+            shadow_mutator.parse_source_text(self._scene_path, source_text)
+        except Exception as exc:
+            return False, f"AST scan failed: {exc}"
+
+        ok, message = self.canvas.shadow_validate_scene_source(
+            source_text=source_text,
+            module_name=self.SCENE_MODULE,
+            scene_file=self._scene_path,
+        )
+        return ok, message
+
+    def _write_source_atomic(self, path: str | os.PathLike[str], source_text: str) -> bool:
+        path = Path(path)
+        dir_path = path.parent
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(dir_path),
+            suffix=".py.tmp",
+            prefix=".bisync_editor_",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(source_text)
+                if not source_text.endswith("\n"):
+                    handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.rename(tmp_path, str(path))
+            return True
+        except Exception as exc:
+            logger.error("Atomic editor write failed: %s", exc)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return False
+
+    def _process_scene_file_update(self, path: str, *, sync_code_editor: bool) -> bool:
+        if self.engine_state.reload_guard_mode == self.engine_state.RELOAD_BLOCK_DURING_BURST:
+            self._deferred_full_reload_path = path
+            return True
+
+        selected_animation_key = (
+            self.engine_state.selected_animation.animation_key
+            if self.engine_state.selected_animation is not None
+            else None
+        )
+        selection_token = self._capture_selection_rebind()
+        old_bindings, old_animations = self._snapshot_ast_state()
+
+        try:
+            self.ast_mutator.parse_file(path)
+        except Exception as exc:
+            logger.error("Scene file parse failed for %s: %s", os.path.basename(path), exc)
+            self.status_bar.showMessage("⚠ Preview frozen — code parse failed")
+            return False
+
+        try:
+            self._normalize_scene_source_if_needed(path)
+        except Exception as exc:
+            logger.error("Scene source normalization failed for %s: %s", os.path.basename(path), exc)
+            self.status_bar.showMessage("⚠ Preview frozen — source normalization failed")
+            return False
+        self._rebind_selected_animation(selected_animation_key)
+
+        new_bindings = {
+            ref.variable_name: ref
+            for ref in self.ast_mutator.bindings.values()
+        }
+        decision = decide_scene_sync(
+            old_bindings=old_bindings,
+            new_bindings=new_bindings,
+            old_animations=old_animations,
+            new_animations=self.ast_mutator.animations,
+        )
+
+        if not self.engine_state.scene_is_healthy or decision.mode != "property_only":
+            if self.engine_state.interaction_burst_active:
+                self._deferred_full_reload_path = path
+                return True
+            if not self.engine_state.scene_is_healthy:
+                logger.info("FULL RELOAD required: scene marked unhealthy")
+            elif decision.reasons:
+                logger.info("FULL RELOAD required: %s", "; ".join(decision.reasons))
+            self._pending_selection_rebind = selection_token
+            if not self._do_full_reload(path):
+                return False
         else:
-            self._do_property_update()
+            self._apply_property_updates(decision.property_updates)
             self.property_panel.sync_from_code()
 
+        if sync_code_editor:
+            self.code_editor.sync_from_file()
+
+        self._sync_animation_toolbar(force_progress_sync=True)
         self.engine_state.request_render()
-        logger.info("Code change processed")
+        return True
 
-    def _do_property_update(self) -> None:
-        """Fast path: apply property changes to existing mobjects.
-
-        Passes ALL property types (numbers, colors, strings) to hot_swap.
-        """
-        all_props = self.ast_mutator.get_all_properties()
-        for var_name, props in all_props.items():
+    def _apply_property_updates(self, property_updates: dict[str, dict[str, Any]]) -> None:
+        """Fast path: apply only the safe constructor-property diffs."""
+        applied = 0
+        for var_name, props in property_updates.items():
             for prop_name, value in props.items():
-                if value is not None:
-                    self.hot_swap.apply_single_property(
-                        var_name, prop_name, value
-                    )
+                if value is None:
+                    continue
+                if self.hot_swap.apply_single_property(var_name, prop_name, value):
+                    applied += 1
 
         self.engine_state.emit_gui_update()
-        logger.info("Property-only update applied")
+        logger.info("Property-only update applied (%d changes)", applied)
 
-    def _do_full_reload(self, path: str) -> None:
+    def _do_full_reload(self, path: str) -> bool:
         """Slow path: full scene reload via importlib.reload.
 
         Destroys old scene, re-imports module, constructs new scene.
         Then re-wires all controllers to the new scene.
         """
         logger.info("Starting FULL SCENE RELOAD...")
+        if self._pending_selection_rebind is None:
+            self._pending_selection_rebind = self._capture_selection_rebind()
+        self._begin_scene_transition(
+            status_message="⟳ Rebuilding scene...",
+            render_state=self.engine_state.RENDER_LOADING,
+            reset_toolbar=not self.engine_state.interaction_burst_active,
+        )
+        self._pending_scene_ready_status = "⟳ Scene refreshed"
+        self._pending_scene_ready_sync_properties = True
 
         # Clear live binds before reload
         self.ast_mutator._live_binds.clear()
@@ -466,29 +702,31 @@ class MainWindow(QMainWindow):
         )
 
         if success:
-            # Re-wire all controllers to the new scene
             scene = self.canvas.get_scene()
             if scene is not None:
-                self.hot_swap.set_scene(scene, self._scene_path)
-                self.drag_controller.set_scene(scene)
-                self.animation_player.set_scene(scene)
-
-                self.coord_transformer.set_widget_size(
-                    self.canvas.width(), self.canvas.height()
-                )
-
-                # Sync sliders from new code
-                self.property_panel.sync_from_code()
-
                 anim_count = self.animation_player.animation_count
                 self.status_bar.showMessage(
-                    f"Scene reloaded | {len(scene.mobjects)} objects | "
-                    f"{anim_count} animations"
+                    f"Scene reloaded | {len(scene.mobjects)} objects | {anim_count} animations"
                 )
                 logger.info("Full reload complete — all controllers re-wired")
+            return True
         else:
+            self._pending_scene_ready_status = None
+            self._pending_scene_ready_sync_properties = False
+            self._pending_selection_rebind = None
+            self.engine_state.mark_scene_unhealthy()
             logger.error("Full reload FAILED — scene unchanged")
             self.status_bar.showMessage("⚠ Scene reload failed")
+            return False
+
+    def _on_property_panel_full_reload_requested(self, path: str) -> None:
+        """Force source-of-truth reconstruction after a persistent panel edit."""
+        logger.info("Property panel requested full reload: %s", os.path.basename(path))
+        self.ast_mutator.parse_file(path)
+        self._normalize_scene_source_if_needed(path)
+        self._do_full_reload(path)
+        self.code_editor.sync_from_file()
+        self.engine_state.request_render()
 
     def _on_transform_drag_requested(self, target_var: str, method_name: str, value: float) -> None:
         """Handle transform drag with debouncing to avoid freezing."""
@@ -504,13 +742,77 @@ class MainWindow(QMainWindow):
         self._pending_transform = None
         
         # AST surgery: modify source code in memory
-        self.ast_mutator.update_transform_method(target_var, method_name, value)
+        if not self.ast_mutator.update_transform_method(target_var, method_name, value):
+            logger.error("Transform update failed for %s.%s", target_var, method_name)
+            return
         
         scene_file = self.ast_mutator._file_path
         if scene_file:
-            self.ast_mutator.save_atomic()
+            if not self.ast_mutator.save_atomic():
+                logger.error("Transform save failed for %s.%s", target_var, method_name)
+                return
             # Fast update for transform changes instead of full reload to prevent flicker
             self._do_full_reload(str(scene_file))
+
+    def _rebind_selected_animation(self, animation_key: Optional[str]) -> None:
+        if not animation_key:
+            return
+        self.engine_state.selected_animation = self.ast_mutator.get_animation_by_key(animation_key)
+
+    def _flush_pending_transform_reload(self) -> None:
+        if self._transform_drag_timer.isActive():
+            self._transform_drag_timer.stop()
+        if self._pending_transform:
+            self._execute_debounced_transform_reload()
+
+    def _commit_pending_edits_for_export(self) -> Optional[str]:
+        animation_key = (
+            self.engine_state.selected_animation.animation_key
+            if self.engine_state.selected_animation is not None
+            else None
+        )
+
+        watcher = self.file_watcher
+        if watcher is not None:
+            watcher.pause()
+
+        try:
+            self.property_panel.commit_pending_edits()
+            editor_error = self.code_editor.flush_pending_save()
+            if editor_error is not None:
+                return f"Code editor draft could not be applied: {editor_error}"
+
+            if not self.drag_controller.commit_active_drag():
+                return self.ast_mutator.last_error or "Active drag could not be committed."
+
+            self._flush_pending_transform_reload()
+
+            if self._normalize_scene_source_if_needed(self._scene_path):
+                self.code_editor.sync_from_file()
+
+            if self.ast_mutator.is_dirty and not self.ast_mutator.save_atomic():
+                return "AST changes could not be saved before export."
+
+            expected_source = self.ast_mutator.rendered_source.rstrip()
+            disk_source = Path(self._scene_path).read_text(encoding="utf-8").rstrip()
+            if expected_source and disk_source != expected_source:
+                return "Disk source is out of sync with in-memory AST state."
+
+            self.ast_mutator.parse_file(self._scene_path)
+            self._rebind_selected_animation(animation_key)
+            self.engine_state.emit_gui_update()
+            self._sync_animation_toolbar(force_progress_sync=True)
+            self.engine_state.request_render()
+            return None
+        finally:
+            if watcher is not None:
+                watcher.resume()
+
+    def _normalize_scene_source_if_needed(self, path: str | os.PathLike[str]) -> bool:
+        """Auto-repair known constructor/source incompatibilities in the scene file."""
+        # ASTMutator no longer supports repair_source_compatibility.
+        # This is kept for backward compatibility with the call sites but does nothing.
+        return False
 
     # ────────────────────────────────────────────────────────────
     # Animation Toolbar
@@ -719,7 +1021,7 @@ class MainWindow(QMainWindow):
         progress = value / 1000.0
         self.animation_player.seek(progress)
 
-        total_anims = len(self.ast_mutator.animations)
+        total_anims = self.animation_player.animation_count
         if total_anims == 0:
             self.engine_state.selected_animation = None
             return
@@ -738,11 +1040,18 @@ class MainWindow(QMainWindow):
         self.animation_player.pause()
 
     def _on_reset_clicked(self) -> None:
-        self.animation_player.reset()
-        self._progress_slider.blockSignals(True)
-        self._progress_slider.setValue(0)
-        self._progress_slider.blockSignals(False)
-        self._anim_label.setText("  Reset — press ▶ Play")
+        logger.info("🔄 Reset requested")
+        self._begin_scene_transition(
+            status_message="Resetting scene...",
+            render_state=self.engine_state.RENDER_LOADING,
+            reset_toolbar=True,
+        )
+        self.ast_mutator.parse_file(self._scene_path)
+        self._normalize_scene_source_if_needed(self._scene_path)
+        self._pending_selection_rebind = None
+        self._do_full_reload(self._scene_path)
+        self.code_editor.sync_from_file()
+        self.engine_state.request_render()
 
     def _on_save_clicked(self) -> None:
         """Manually trigger AST atomic save."""
@@ -753,11 +1062,16 @@ class MainWindow(QMainWindow):
     def _on_refresh_clicked(self) -> None:
         """Force full scene reload from disk."""
         logger.info("⟳ Manual refresh requested")
+        self._begin_scene_transition(
+            status_message="⟳ Refreshing scene...",
+            render_state=self.engine_state.RENDER_LOADING,
+            reset_toolbar=True,
+        )
         self.ast_mutator.parse_file(self._scene_path)
+        self._normalize_scene_source_if_needed(self._scene_path)
         self._do_full_reload(self._scene_path)
         self.code_editor.sync_from_file()
         self.engine_state.request_render()
-        self.status_bar.showMessage("⟳ Scene refreshed")
 
     def _on_toggle_code(self, checked: bool) -> None:
         """Toggle the visibility of the Code Editor panel."""
@@ -775,32 +1089,11 @@ class MainWindow(QMainWindow):
 
     def _on_anim_state_changed(self, state: str) -> None:
         """Update toolbar buttons based on animation state."""
-        is_playing = state == self.animation_player.PLAYING
-        is_idle = state == self.animation_player.IDLE
-
-        self._btn_play.setEnabled(not is_playing)
-        self._btn_pause.setEnabled(is_playing)
-
-        if is_playing:
-            self._btn_play.setText("▶  Playing...")
-            self._anim_label.setText("  ▶ Animating...")
-        elif state == self.animation_player.PAUSED:
-            self._btn_play.setText("▶  Resume")
-            self._anim_label.setText("  ⏸ Paused")
-        elif is_idle:
-            self._btn_play.setText("▶  Play")
-            count = self.animation_player.animation_count
-            if self.animation_player.progress >= 1.0:
-                self._anim_label.setText(f"  ✅ Complete ({count} animations)")
-            else:
-                self._anim_label.setText(f"  Ready ({count} animations)")
+        self._sync_animation_toolbar(state=state)
 
     def _on_anim_progress(self, progress: float) -> None:
         """Update progress slider during animation."""
-        if not self._progress_slider.isSliderDown():
-            self._progress_slider.blockSignals(True)
-            self._progress_slider.setValue(int(progress * 1000))
-            self._progress_slider.blockSignals(False)
+        self._sync_animation_toolbar(progress=progress)
 
     # ────────────────────────────────────────────────────────────
     # Video Export
@@ -815,6 +1108,14 @@ class MainWindow(QMainWindow):
 
     def _start_export(self, settings: dict) -> None:
         """Launch background export worker."""
+        preflight_error = self._commit_pending_edits_for_export()
+        if preflight_error is not None:
+            from PyQt6.QtWidgets import QMessageBox
+
+            QMessageBox.warning(self, "Export Failed", preflight_error)
+            logger.error(f"Export preflight failed: {preflight_error}")
+            return
+
         logger.info(
             f"Export started: {settings['resolution_name']} @ "
             f"{settings['fps']}fps ({settings['format']})"
@@ -876,25 +1177,34 @@ def main() -> None:
     logger.info("  Bi-Sync Manim Engine — Phase 3 Starting  ")
     logger.info("═══════════════════════════════════════════")
 
-    # Step 1: Configure OpenGL BEFORE QApplication
-    setup_opengl_format()
+    try:
+        # Step 1: Configure OpenGL BEFORE QApplication
+        setup_opengl_format()
 
-    # Step 2: Create Qt Application
-    app = QApplication(sys.argv)
-    apply_dark_theme(app)
+        # Step 2: Create Qt Application
+        app = QApplication(sys.argv)
+        apply_dark_theme(app)
 
-    # Step 3: Create and show main window
-    window = MainWindow()
-    window.show()
+        # Step 3: Create and show main window
+        window = MainWindow()
+        window.show()
 
-    logger.info("Window shown — entering Qt event loop")
+        logger.info("Window shown — entering Qt event loop")
 
-    # Step 4: Run event loop
-    exit_code = app.exec()
+        # Step 4: Run event loop
+        exit_code = app.exec()
 
-    logger.info(f"Application exited with code: {exit_code}")
-    sys.exit(exit_code)
+        logger.info(f"Application exited with code: {exit_code}")
+        sys.exit(exit_code)
 
+    except Exception as e:
+        logger.error(f"Fatal error during execution: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    except KeyboardInterrupt:
+        logger.info("User interrupted execution. Exiting gracefully.")
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()

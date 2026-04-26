@@ -22,6 +22,7 @@ import logging
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
+from dataclasses import dataclass
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QFont, QTextCharFormat, QSyntaxHighlighter
@@ -39,6 +40,12 @@ if TYPE_CHECKING:
     from engine.state import EngineState
     from engine.file_watcher import SceneFileWatcher
 
+@dataclass
+class ShadowBuildResult:
+    applied: bool
+    status: str
+    error: Optional[str] = None
+    applied_source: Optional[str] = None
 
 class PythonHighlighter(QSyntaxHighlighter):
     """Minimal Python syntax highlighter for the code editor.
@@ -232,7 +239,7 @@ class CodeEditorPanel(QDockWidget):
             self._is_programmatic_change = True
             self._editor.setPlainText(content)
             self._is_programmatic_change = False
-            logger.debug(f"Loaded {os.path.basename(self._scene_file)}")
+            pass
         except Exception as e:
             logger.error(f"Failed to load file: {e}")
 
@@ -280,14 +287,15 @@ class CodeEditorPanel(QDockWidget):
                     self._file_watcher.resume()
                 return
 
-            Path(self._scene_file).write_text(content, encoding="utf-8")
-            logger.info("Code Editor → file saved (debounce)")
-
-            # Trigger FULL reload pipeline via MainWindow callback
             if self._on_code_saved_callback:
-                self._on_code_saved_callback(self._scene_file)
+                result = self._on_code_saved_callback(content)
+                if result and not getattr(result, "applied", True):
+                    logger.warning(f"Shadow build rejected: {getattr(result, 'status', 'unknown')}")
+                else:
+                    logger.info("Code Editor → shadow build accepted & saved")
             else:
-                # Fallback: at least repaint
+                # Fallback: write to file and at least repaint
+                Path(self._scene_file).write_text(content, encoding="utf-8")
                 self._engine_state.request_render()
 
         except Exception as e:
@@ -333,7 +341,22 @@ class CodeEditorPanel(QDockWidget):
                 self._editor.setTextCursor(cursor)
                 self._editor.verticalScrollBar().setValue(scroll_val)
 
-                logger.debug("Code Editor synced from file (ghost-typing)")
+                pass
 
         except Exception as e:
             logger.error(f"Code Editor sync failed: {e}")
+
+    def flush_pending_save(self) -> Optional[str]:
+        """Force-apply pending debounce save before export.
+
+        Returns:
+            None on success, otherwise an error string.
+        """
+        try:
+            if self._save_timer.isActive():
+                self._save_timer.stop()
+                self._on_debounce_save()
+            return None
+        except Exception as e:
+            logger.error(f"Code Editor flush failed: {e}")
+            return str(e)

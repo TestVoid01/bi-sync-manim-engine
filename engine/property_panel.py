@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QDockWidget,
     QGroupBox,
@@ -32,6 +32,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QLineEdit,
+    QPushButton,
+    QComboBox,
 )
 
 logger = logging.getLogger("bisync.property_panel")
@@ -189,17 +191,62 @@ class PropertySlider(QWidget):
 
         # Convert float range to integer range for QSlider
         self._multiplier = int(1.0 / step)
+        self._step_options = [0.01, 0.1, 1.0]
+        if step not in self._step_options:
+            self._step_options.append(step)
+            self._step_options = sorted(set(self._step_options))
 
-        layout = QHBoxLayout(self)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(4)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
 
         # Label
         self._label = QLabel(label)
-        self._label.setFixedWidth(100)
+        self._label.setFixedWidth(92)
         self._label.setStyleSheet("color: #aaa; font-size: 12px;")
-        layout.addWidget(self._label)
+        row.addWidget(self._label)
 
-        # Slider
+        # Minus button
+        self._btn_minus = QPushButton("-")
+        self._btn_minus.setFixedWidth(26)
+        row.addWidget(self._btn_minus)
+
+        # Numeric input
+        self._value_input = QLineEdit(f"{initial:.2f}")
+        self._value_input.setFixedWidth(70)
+        self._value_input.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._value_input.setStyleSheet("""
+            QLineEdit {
+                background: #333;
+                color: #4a90d9;
+                border: 1px solid #555;
+                border-radius: 3px;
+                padding: 2px 4px;
+                font-weight: bold;
+            }
+        """)
+        self._value_input.installEventFilter(self)
+        row.addWidget(self._value_input)
+
+        # Plus button
+        self._btn_plus = QPushButton("+")
+        self._btn_plus.setFixedWidth(26)
+        row.addWidget(self._btn_plus)
+
+        # Step selector
+        self._step_combo = QComboBox()
+        self._step_combo.setFixedWidth(72)
+        self._step_combo.addItems([f"{s:g}" for s in self._step_options])
+        self._step_combo.setCurrentText(f"{self._step:g}")
+        row.addWidget(self._step_combo)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        # Optional coarse slider
         self._slider = QSlider(Qt.Orientation.Horizontal)
         self._slider.setMinimum(int(min_val * self._multiplier))
         self._slider.setMaximum(int(max_val * self._multiplier))
@@ -221,29 +268,77 @@ class PropertySlider(QWidget):
                 background: #5ba0e9;
             }
         """)
-        layout.addWidget(self._slider, stretch=1)
-
-        # Value display
-        self._value_label = QLabel(f"{initial:.1f}")
-        self._value_label.setFixedWidth(40)
-        self._value_label.setAlignment(Qt.AlignmentFlag.AlignRight)
-        self._value_label.setStyleSheet("color: #4a90d9; font-size: 12px; font-weight: bold;")
-        layout.addWidget(self._value_label)
+        layout.addWidget(self._slider)
+        self._pending_label = QLabel("")
+        self._pending_label.setStyleSheet("color: #d1b36a; font-size: 10px;")
+        layout.addWidget(self._pending_label)
 
         # Connect signals
         self._slider.valueChanged.connect(self._on_slider_changed)
         self._slider.sliderReleased.connect(self._on_slider_released)
+        self._btn_minus.clicked.connect(lambda: self._nudge(-1))
+        self._btn_plus.clicked.connect(lambda: self._nudge(1))
+        self._value_input.editingFinished.connect(self._on_input_committed)
+        self._step_combo.currentTextChanged.connect(self._on_step_changed)
+
+    def eventFilter(self, obj, event):
+        if obj is self._value_input and event.type() == event.Type.KeyPress:
+            key = event.key()
+            if key in (Qt.Key.Key_Left, Qt.Key.Key_Down):
+                self._nudge(-1, modifiers=event.modifiers())
+                return True
+            if key in (Qt.Key.Key_Right, Qt.Key.Key_Up):
+                self._nudge(1, modifiers=event.modifiers())
+                return True
+        return super().eventFilter(obj, event)
 
     def _on_slider_changed(self, int_value: int) -> None:
         """Continuous update during drag."""
         value = int_value / self._multiplier
-        self._value_label.setText(f"{value:.1f}")
+        self._value_input.setText(f"{value:.2f}")
         self.value_changed.emit(value)
 
     def _on_slider_released(self) -> None:
         """Final update on mouse release."""
         value = self._slider.value() / self._multiplier
         self.value_released.emit(value)
+
+    def _on_input_committed(self) -> None:
+        try:
+            value = float(self._value_input.text().strip())
+        except ValueError:
+            value = self.get_value()
+        value = max(self._min, min(self._max, value))
+        self._slider.blockSignals(True)
+        self._slider.setValue(int(value * self._multiplier))
+        self._slider.blockSignals(False)
+        self._value_input.setText(f"{value:.2f}")
+        self.value_changed.emit(value)
+        self.value_released.emit(value)
+
+    def _on_step_changed(self, text: str) -> None:
+        try:
+            self._step = float(text)
+        except ValueError:
+            self._step = 0.1
+
+    def _nudge(self, direction: int, modifiers=None) -> None:
+        step = self._step
+        if modifiers is not None:
+            if modifiers & Qt.KeyboardModifier.ShiftModifier:
+                step *= 10.0
+            if modifiers & Qt.KeyboardModifier.AltModifier:
+                step *= 0.1
+        value = self.get_value() + (direction * step)
+        value = max(self._min, min(self._max, value))
+        self._slider.blockSignals(True)
+        self._slider.setValue(int(value * self._multiplier))
+        self._slider.blockSignals(False)
+        self._value_input.setText(f"{value:.2f}")
+        self.value_changed.emit(value)
+
+    def set_pending(self, pending: bool) -> None:
+        self._pending_label.setText("pending..." if pending else "")
 
     def set_value(self, value: float) -> None:
         """Programmatically set the slider value (for state reconciliation).
@@ -252,7 +347,7 @@ class PropertySlider(QWidget):
         """
         self._slider.blockSignals(True)
         self._slider.setValue(int(value * self._multiplier))
-        self._value_label.setText(f"{value:.1f}")
+        self._value_input.setText(f"{value:.2f}")
         self._slider.blockSignals(False)
 
     def get_value(self) -> float:
@@ -334,6 +429,7 @@ class PropertyPanel(QDockWidget):
     """
 
     transform_drag_requested = pyqtSignal(str, str, float)
+    full_reload_requested = pyqtSignal(str)
 
     def __init__(
         self,
@@ -352,6 +448,13 @@ class PropertyPanel(QDockWidget):
         # Store dynamic sliders {prop_name: PropertySlider}
         self._dynamic_sliders: dict[str, PropertySlider] = {}
         self._current_var_name: Optional[str] = None
+        self._pending_commits: dict[tuple[str, str, str], tuple[str, str, Any]] = {}
+        self._pending_widgets: dict[tuple[str, str, str], PropertySlider] = {}
+        self._commit_timer = QTimer(self)
+        self._commit_timer.setSingleShot(True)
+        self._commit_timer.setInterval(150)
+        self._commit_timer.timeout.connect(self._flush_pending_commits)
+        self._engine_state.set_interaction_state("idle")
 
         # Don't allow closing
         self.setFeatures(
@@ -394,7 +497,11 @@ class PropertyPanel(QDockWidget):
 
     def _on_selection_changed(self, var_name: Optional[str]) -> None:
         """Triggered when user clicks an object in the canvas."""
-        self._current_var_name = var_name
+        selection = getattr(self._engine_state, "selected_object", None)
+        if selection is not None:
+            self._current_var_name = selection.variable_name
+        else:
+            self._current_var_name = var_name
         self._build_dynamic_ui()
 
     def _build_dynamic_ui(self) -> None:
@@ -407,6 +514,49 @@ class PropertyPanel(QDockWidget):
         
         self._dynamic_sliders.clear()
 
+        selection = getattr(self._engine_state, "selected_object", None)
+
+        from engine.property_inspector import PropertyInspector
+        scene_getter = lambda: getattr(self._hot_swap, "_current_scene", None)
+        inspector = PropertyInspector(
+            ast_mutator=self._ast_mutator,
+            object_registry=self._engine_state.object_registry,
+            scene_getter=scene_getter,
+        )
+        live_specs = inspector.inspect_selection(selection) if selection else []
+
+        if selection is not None and getattr(selection, "editability", "source_editable") != "source_editable":
+            self._engine_state.set_interaction_state("read_only_target")
+            self._title.setText(f"Properties: {selection.display_name or 'Selection'} (Read-only)")
+            reason = getattr(selection, "read_only_reason", "") or "This runtime object is not source-editable."
+            lbl = QLabel(reason)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("color: #c0a060; font-size: 12px; padding: 6px 0;")
+            self._content_layout.addWidget(lbl)
+            
+            if live_specs:
+                self._add_section_label("Discovered Properties")
+                for spec in live_specs:
+                    if spec.section == "Live Readout":
+                        val_str = str(spec.value)
+                        if isinstance(spec.value, float):
+                            val_str = f"{spec.value:.3f}"
+                        row = QHBoxLayout()
+                        row.setContentsMargins(0, 0, 0, 0)
+                        name_lbl = QLabel(spec.name)
+                        name_lbl.setStyleSheet("color: #ccc; font-size: 12px;")
+                        val_lbl = QLabel(val_str)
+                        val_lbl.setStyleSheet("color: #888; font-size: 12px;")
+                        row.addWidget(name_lbl)
+                        row.addStretch()
+                        row.addWidget(val_lbl)
+                        w = QWidget()
+                        w.setLayout(row)
+                        self._content_layout.addWidget(w)
+            
+            self._append_live_readout()
+            return
+
         if not self._current_var_name:
             self._title.setText("Scene Properties (No Selection)")
             return
@@ -418,6 +568,7 @@ class PropertyPanel(QDockWidget):
             return
 
         self._title.setText(f"Properties: {self._current_var_name} ({ref.constructor_name})")
+        self._add_section_label("Source Properties")
 
         ast_props = ref.properties
         schema_props = MANIM_SCHEMA.get(ref.constructor_name, DEFAULT_VMOBJECT_SCHEMA).copy()
@@ -501,6 +652,7 @@ class PropertyPanel(QDockWidget):
         # ---------------------------------------------------------------------
         # Transform Section (Scale, Rotate)
         # ---------------------------------------------------------------------
+        self._add_section_label("Source Chain")
         transform_group = QGroupBox("Transforms")
         transform_group.setStyleSheet("QGroupBox { color: #aaa; font-weight: bold; padding-top: 15px; }")
         transform_layout = QVBoxLayout(transform_group)
@@ -574,6 +726,51 @@ class PropertyPanel(QDockWidget):
             
             self._content_layout.addWidget(anim_group)
 
+        if live_specs:
+            self._add_section_label("Discovered Properties")
+            for spec in live_specs:
+                if spec.section == "Live Readout" and spec.name not in props:
+                    if spec.widget_hint == "slider" and isinstance(spec.value, (int, float)):
+                        min_val, max_val, _ = spec.range_hint or (0.0, 1.0, 0.1)
+                        if spec.value < min_val: min_val = float(spec.value) - 5.0
+                        if spec.value > max_val: max_val = float(spec.value) + 5.0
+                        if min_val == max_val: max_val += 1.0
+                        slider = PropertySlider(
+                            label=spec.name,
+                            min_val=min_val,
+                            max_val=max_val,
+                            initial=float(spec.value)
+                        )
+                        slider.value_changed.connect(
+                            lambda v, v_name=self._current_var_name, p_name=spec.name: 
+                                self._on_drag(v_name, p_name, v)
+                        )
+                        slider.value_released.connect(
+                            lambda v, v_name=self._current_var_name, p_name=spec.name: 
+                                self._on_release(v_name, p_name, v)
+                        )
+                        self._content_layout.addWidget(slider)
+                        self._dynamic_sliders[spec.name] = slider
+                    else:
+                        val_str = str(spec.value)
+                        if isinstance(spec.value, float):
+                            val_str = f"{spec.value:.3f}"
+                        row = QHBoxLayout()
+                        row.setContentsMargins(0, 0, 0, 0)
+                        name_lbl = QLabel(spec.name)
+                        name_lbl.setStyleSheet("color: #ccc; font-size: 12px;")
+                        val_lbl = QLabel(val_str)
+                        val_lbl.setStyleSheet("color: #888; font-size: 12px;")
+                        row.addWidget(name_lbl)
+                        row.addStretch()
+                        row.addWidget(val_lbl)
+                        w = QWidget()
+                        w.setLayout(row)
+                        self._content_layout.addWidget(w)
+
+        self._add_section_label("Live Readout")
+        self._append_live_readout()
+
     def _on_drag(self, target_var: str, prop_name: str, value: float) -> None:
         """Handle continuous slider drag — in-memory update only.
 
@@ -587,7 +784,9 @@ class PropertyPanel(QDockWidget):
             self._file_watcher.pause()
 
         # Fast path: apply directly to scene mobject (in-memory)
+        self._engine_state.set_interaction_state("previewing")
         self._hot_swap.apply_single_property(target_var, prop_name, value)
+        self._queue_commit(target_var, prop_name, value, kind="property")
 
         # Trigger re-render
         self._engine_state.request_render()
@@ -598,15 +797,7 @@ class PropertyPanel(QDockWidget):
         Slow path: AST surgery → atomic file save → resume watcher.
         This is the only time we touch the SSD.
         """
-        # AST surgery: modify source code
-        self._ast_mutator.update_property(target_var, prop_name, value)
-        self._ast_mutator.save_atomic()
-
-        # Resume file watcher
-        if self._file_watcher:
-            self._file_watcher.resume()
-
-        logger.info(f"Slider released: {target_var}.{prop_name} = {value}")
+        self._queue_commit(target_var, prop_name, value, kind="property", immediate=True)
 
     # -------------------------------------------------------------------------
     # Transform Callbacks
@@ -619,6 +810,7 @@ class PropertyPanel(QDockWidget):
         # We emit a signal so main.py can debounce and handle the full reload safely
         if hasattr(self, 'transform_drag_requested'):
             self.transform_drag_requested.emit(target_var, method_name, value)
+            self._queue_commit(target_var, method_name, value, kind="transform")
         else:
             # Fallback if signal isn't wired up yet
             self._ast_mutator.update_transform_method(target_var, method_name, value)
@@ -631,11 +823,7 @@ class PropertyPanel(QDockWidget):
 
     def _on_transform_release(self, target_var: str, method_name: str, value: float) -> None:
         """Slow path for transform (e.g. scale) updates."""
-        self._ast_mutator.update_transform_method(target_var, method_name, value)
-        self._ast_mutator.save_atomic()
-        if self._file_watcher:
-            self._file_watcher.resume()
-        logger.info(f"Transform released: {target_var}.{method_name}({value})")
+        self._queue_commit(target_var, method_name, value, kind="transform", immediate=True)
 
     # -------------------------------------------------------------------------
     # Animation Callbacks
@@ -713,3 +901,162 @@ class PropertyPanel(QDockWidget):
                 self._dynamic_sliders["_run_time"].set_value(float(run_time_val))
 
         logger.info("Dynamic sliders synced from code (State Reconciliation)")
+
+    def commit_pending_edits(self) -> None:
+        """Compatibility hook used before export.
+
+        This panel applies edits immediately on slider/string release, so there
+        is no deferred transaction queue to flush.
+        """
+        self._flush_pending_commits()
+        if self._file_watcher:
+            self._file_watcher.resume()
+
+    def _add_section_label(self, text: str) -> None:
+        label = QLabel(text)
+        label.setStyleSheet("color: #8fb3ff; font-size: 11px; font-weight: bold; padding: 6px 0 2px 0;")
+        self._content_layout.addWidget(label)
+
+    def _append_live_readout(self) -> None:
+        selection = getattr(self._engine_state, "selected_object", None)
+        if selection is None:
+            lbl = QLabel("No live object selected.")
+            lbl.setStyleSheet("color: #888; font-size: 12px;")
+            self._content_layout.addWidget(lbl)
+            return
+
+        scene = getattr(self._hot_swap, "_current_scene", None)
+        registry = getattr(self._engine_state, "object_registry", None)
+        live_mob = None
+        if scene is not None and registry is not None:
+            try:
+                live_mob = registry.find_mobject(scene, selection.mobject_id)
+            except Exception:
+                live_mob = None
+
+        rows: list[tuple[str, str]] = [
+            ("display", selection.display_name or selection.variable_name),
+            ("source", selection.source_key or "runtime-only"),
+            ("mode", selection.editability),
+        ]
+        strategy = self._ast_mutator.plan_property_persistence(
+            selection.variable_name,
+            "__selection__",
+            source_key=selection.source_key,
+            path=tuple(selection.path or ()),
+        )
+        rows.append(("persist", strategy.mode))
+        if strategy.reason:
+            rows.append(("persist_reason", strategy.reason))
+
+        if live_mob is not None:
+            try:
+                center = live_mob.get_center()
+                rows.append(("center", f"({float(center[0]):.2f}, {float(center[1]):.2f})"))
+            except Exception:
+                pass
+            try:
+                rows.append(("width", f"{float(getattr(live_mob, 'width', 0.0)):.2f}"))
+                rows.append(("height", f"{float(getattr(live_mob, 'height', 0.0)):.2f}"))
+            except Exception:
+                pass
+            try:
+                color = getattr(live_mob, "color", None)
+                if color is not None:
+                    rows.append(("color", str(color)))
+            except Exception:
+                pass
+
+        for key, value in rows:
+            lbl = QLabel(f"{key}: {value}")
+            lbl.setStyleSheet("color: #bbb; font-size: 11px; padding: 1px 0;")
+            self._content_layout.addWidget(lbl)
+
+    def _queue_commit(
+        self,
+        target_var: str,
+        prop_name: str,
+        value: Any,
+        *,
+        kind: str,
+        immediate: bool = False,
+    ) -> None:
+        key = (kind, target_var, prop_name)
+        self._pending_commits[key] = (target_var, prop_name, value)
+        widget = self._dynamic_sliders.get(prop_name)
+        if isinstance(widget, PropertySlider):
+            widget.set_pending(True)
+            self._pending_widgets[key] = widget
+        self._engine_state.interaction_burst_active = True
+        self._engine_state.set_interaction_state(self._engine_state.STATE_COMMIT_PENDING)
+        self._engine_state.reload_guard_mode = self._engine_state.RELOAD_BLOCK_DURING_BURST
+        if immediate:
+            self._flush_pending_commits()
+            return
+        self._commit_timer.start()
+
+    def _flush_pending_commits(self) -> None:
+        if not self._pending_commits:
+            self._engine_state.interaction_burst_active = False
+            self._engine_state.set_interaction_state(self._engine_state.STATE_IDLE)
+            self._engine_state.reload_guard_mode = self._engine_state.RELOAD_ALLOW_FULL
+            return
+
+        commits = list(self._pending_commits.items())
+        self._pending_commits.clear()
+        self._engine_state.set_interaction_state(self._engine_state.STATE_COMMITTING)
+
+        changed = False
+        for (kind, _target_var, _prop_name), (target_var, prop_name, value) in commits:
+            if kind == "property":
+                if self._commit_property(target_var, prop_name, value): changed = True
+            elif kind == "transform":
+                if self._commit_transform(target_var, prop_name, value): changed = True
+
+        if changed:
+            self._ast_mutator.save_atomic()
+            if self._file_watcher:
+                self._file_watcher.notify_internal_commit()
+
+        for key, widget in list(self._pending_widgets.items()):
+            if isinstance(widget, PropertySlider):
+                widget.set_pending(False)
+            self._pending_widgets.pop(key, None)
+
+        if self._file_watcher:
+            self._file_watcher.resume()
+        self._engine_state.interaction_burst_active = False
+        self._engine_state.set_interaction_state(self._engine_state.STATE_SETTLED)
+        self._engine_state.reload_guard_mode = self._engine_state.RELOAD_ALLOW_FULL
+
+    def _commit_property(self, target_var: str, prop_name: str, value: Any) -> bool:
+        selection = getattr(self._engine_state, "selected_object", None)
+        strategy = self._ast_mutator.plan_property_persistence(
+            target_var,
+            prop_name,
+            source_key=getattr(selection, "source_key", None),
+            path=tuple(getattr(selection, "path", ()) or ()),
+        )
+        if strategy.no_persist:
+            logger.info(f"Skipped persist for {target_var}.{prop_name}: {strategy.reason}")
+            return False
+        if not self._ast_mutator.persist_property_edit(target_var, prop_name, value, strategy):
+            logger.warning(f"Persist failed for {target_var}.{prop_name}: {strategy.reason}")
+            return False
+        logger.info(f"Slider committed: {target_var}.{prop_name} = {value}")
+        return True
+
+    def _commit_transform(self, target_var: str, method_name: str, value: float) -> bool:
+        selection = getattr(self._engine_state, "selected_object", None)
+        strategy = self._ast_mutator.plan_property_persistence(
+            target_var,
+            method_name,
+            source_key=getattr(selection, "source_key", None),
+            path=tuple(getattr(selection, "path", ()) or ()),
+        )
+        if strategy.no_persist:
+            logger.info(f"Skipped transform persist for {target_var}.{method_name}: {strategy.reason}")
+            return False
+        self._ast_mutator.update_transform_method(target_var, method_name, value)
+        logger.info(f"Transform committed: {target_var}.{method_name}({value})")
+        return True
