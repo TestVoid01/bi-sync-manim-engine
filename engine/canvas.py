@@ -333,6 +333,7 @@ class ManimCanvas(QOpenGLWidget):
             if self._animation_player is not None:
                 player = self._animation_player
                 scene_ref = self._scene
+                
                 def capturing_play(*animations, **kwargs):
                     """Intercept play() — capture animations, add mobjects."""
                     try:
@@ -347,24 +348,48 @@ class ManimCanvas(QOpenGLWidget):
                         logger.warning(f"Animation capture error: {e}")
                         compiled_anims = animations
                         
-                    # Still add the mobjects so they're visible in static mode
+                    # Simply add the mobjects so they are registered in the scene's mobjects list.
+                    # We DO NOT fast-forward or finish the animations here, because doing so
+                    # permanently mutates the scene state (e.g. FadeOut removes them), 
+                    # making AnimationPlayer replay impossible.
                     for anim in compiled_anims:
                         try:
-                            mob = getattr(anim, 'mobject', None)
-                            if mob is not None and mob not in scene_ref.mobjects:
-                                scene_ref.add(mob)
-                        except Exception:
+                            if hasattr(anim, "is_introducer") and anim.is_introducer():
+                                mob = getattr(anim, 'mobject', None)
+                                if mob is not None and mob not in scene_ref.mobjects:
+                                    scene_ref.add(mob)
+                            elif hasattr(anim, "add_to_back") and anim not in scene_ref.mobjects:
+                                scene_ref.add(anim)
+                            # Fallback for standard animations
+                            else:
+                                mob = getattr(anim, 'mobject', None)
+                                if mob is not None and mob not in scene_ref.mobjects:
+                                    scene_ref.add(mob)
+                        except Exception as e:
                             pass
+
+                def capturing_wait(duration=1, **kwargs):
+                    """Intercept wait() — capture as a Wait animation."""
+                    try:
+                        from manim import Wait
+                        w = Wait(duration=duration, **kwargs)
+                        player.capture_play_call(scene_ref, w, **kwargs)
+                    except Exception as e:
+                        logger.warning(f"Wait capture error: {e}")
+
                 self._scene.play = capturing_play
-                self._scene.wait = lambda *a, **kw: None  # skip wait() calls
+                self._scene.wait = capturing_wait
 
             try:
                 self._scene.construct()
                 self._engine_state.scene_is_healthy = True
             except Exception as e:
                 self._engine_state.scene_is_healthy = False
+                logger.error(
+                    f"Scene.construct() failure: {e}\n"
+                    f"{traceback.format_exc()}"
+                )
                 logger.warning(
-                    f"Scene.construct() partial failure: {e}\n"
                     f"Showing {len(self._scene.mobjects)} objects added before error"
                 )
 
@@ -594,9 +619,16 @@ class ManimCanvas(QOpenGLWidget):
                         
                     for anim in compiled_anims:
                         try:
-                            mob = getattr(anim, 'mobject', None)
-                            if mob is not None and mob not in scene_ref.mobjects:
-                                scene_ref.add(mob)
+                            if hasattr(anim, "is_introducer") and anim.is_introducer():
+                                mob = getattr(anim, 'mobject', None)
+                                if mob is not None and mob not in scene_ref.mobjects:
+                                    scene_ref.add(mob)
+                            elif hasattr(anim, "add_to_back") and anim not in scene_ref.mobjects:
+                                scene_ref.add(anim)
+                            else:
+                                mob = getattr(anim, 'mobject', None)
+                                if mob is not None and mob not in scene_ref.mobjects:
+                                    scene_ref.add(mob)
                         except Exception:
                             pass
 
