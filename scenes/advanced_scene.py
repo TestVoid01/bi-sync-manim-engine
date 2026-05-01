@@ -1,67 +1,94 @@
 from manim import *
 import numpy as np
+
 CYAN = '#00FFFF'
 
 class AdvancedScene(ThreeDScene):
-        """
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            Bi-Sync Test Scene — Multiple Sine Waves + Shapes
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            Tests axes.plot(), ParametricFunction, and basic shapes.
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            """
+    """
+    Bi-Sync Test Scene — Beautiful Mathematical Composition
+    Tests axes.plot(), labels, and basic shapes properly arranged.
+    """
 
-        def construct(self):
-            self.camera.background_color = BLACK
-            axes = Axes(x_range=[-4, 4, 1], y_range=[-3, 3, 1], x_length=8, y_length=5, tips=False, axis_config={'color': WHITE, 'stroke_width': 1.0})
-            axes.rotate(0.0)
-            axes.scale(0.4)
-            axes.move_to([4.69, 2.04, 0.0])
-            self.play(Create(axes), run_time=0.8)
-            sine1 = axes.plot(lambda x: np.sin(x), x_range=[-4, 4], color=BLUE)
-            sine1.rotate(0.2)
-            sine1.move_to([-2.93, -4.08, 0.0])
-            self.play(Create(sine1), run_time=1.0)
-            sine2 = axes.plot(lambda x: np.sin(2 * x), x_range=[-4, 4], color=RED, opacity=1.0)
-            sine2.scale(2.1)
-            sine2.move_to([-6.2, -1.04, 0.0])
-            self.play(Create(sine2), run_time=1.0)
-            sine3 = axes.plot(lambda x: 0.5 * np.sin(4 * x), x_range=[-4, 4], color=GREEN)
-            sine3.rotate(0.0)
-            sine3.scale(1.2)
-            sine3.move_to([-0.88, -1.39, 0.0])
-            self.play(DrawBorderThenFill(sine3), run_time=3.0)
-            sine4 = axes.plot(lambda x: np.cos(x), x_range=[-4, 4], color=YELLOW)
-            sine4.scale(1.3)
-            sine4.move_to([-1.99, -0.46, 0.0])
-            self.play(Create(sine4), run_time=1.0)
-            sine5 = axes.plot(lambda x: np.exp(-0.3 * abs(x)) * np.sin(3 * x), x_range=[-4, 4], color=CYAN)
-            sine5.rotate(-0.5)
-            sine5.scale(1.3)
-            sine5.move_to([0.61, 1.35, 0.0])
-            self.play(Create(sine5), run_time=1.0)
-            label1 = MathTex('\\sin(x)', font_size=24, color=BLUE)
-            label1.next_to(axes.c2p(4, np.sin(4)), RIGHT, buff=0.2)
-            label1.move_to([-2.0, 1.4, 0.0])
-            label2 = MathTex('\\sin(2x)', font_size=24, color=RED)
-            label2.next_to(axes.c2p(4, np.sin(8)), RIGHT, buff=0.2)
-            label2.move_to([4.44, 0.01, 0.0])
-            label3 = MathTex('0.5\\sin(4x)', font_size=24, color=GREEN)
-            label3.move_to([6.5, -3.79, 0.0])
-            label4 = MathTex('\\cos(x)', font_size=24, color=YELLOW)
-            label4.move_to([10.48, -5.23, 0.0])
-            label5 = MathTex('e^{-|x|}\\sin(9x)', font_size=22.9, color=CYAN, fill_opacity=0.5)
-            label5.rotate(-2.6)
-            label5.scale(2.1)
-            label5.move_to([3.69, 3.22, 0.0])
-            self.play(FadeIn(label1), FadeIn(label2), SpinInFromNothing(label3), FadeIn(label4), FadeIn(label5), run_time=0.6)
-            self.wait(1)
-            triangle = Triangle(color=PURPLE, fill_opacity=0.8, stroke_width=5.8, opacity=0.4, stroke_opacity=0.8)
-            triangle.rotate(-0.2)
-            triangle.scale(3.8)
-            triangle.move_to([-1.8, 0.9, 0.0])
-            self.play(SpinInFromNothing(triangle), run_time=0.6)
-            square = Square(side_length=4.4, color='RED' if True else ORANGE, fill_opacity=0.3, stroke_width=5.9, stroke_opacity=0.4, opacity=0.5)
-            square.rotate(-3.4)
-            square.scale(1.3)
-            square.move_to([1.57, 2.31, 0.0])
-            self.play(SpinInFromNothin(square), run_time=0.6)
-            self.wait(2)
-            self.wait(2)
+    def construct(self):
+        self.camera.background_color = BLACK
+        
+        # 1. Main Axes (Centered)
+        axes = Axes(
+            x_range=[-4, 4, 1], 
+            y_range=[-3, 3, 1], 
+            x_length=10, 
+            y_length=6, 
+            tips=False, 
+            axis_config={'color': WHITE, 'stroke_width': 2.0}
+        )
+        axes.move_to(ORIGIN)
+        self.play(Create(axes), run_time=1.5)
+
+        # 2. Plotting Functions (Correctly aligned to axes)
+        sine1 = axes.plot(lambda x: np.sin(x), x_range=[-4, 4], color=BLUE)
+        sine2 = axes.plot(lambda x: np.sin(2 * x), x_range=[-4, 4], color=RED) # Fixed opacity bug
+        sine3 = axes.plot(lambda x: 0.5 * np.sin(4 * x), x_range=[-4, 4], color=GREEN)
+        sine4 = axes.plot(lambda x: np.cos(x), x_range=[-4, 4], color=YELLOW)
+        sine5 = axes.plot(lambda x: np.exp(-0.3 * abs(x)) * np.sin(3 * x), x_range=[-4, 4], color=CYAN)
+
+        self.play(
+            Create(sine1), 
+            Create(sine2), 
+            run_time=1.5
+        )
+        self.play(
+            Create(sine3), 
+            Create(sine4), 
+            Create(sine5), 
+            run_time=2.0
+        )
+
+        # 3. Neatly arranged Labels
+        label1 = MathTex('\\sin(x)', font_size=28, color=BLUE)
+        label1.next_to(axes.c2p(2, np.sin(2)), UP)
+
+        label2 = MathTex('\\sin(2x)', font_size=28, color=RED)
+        label2.next_to(axes.c2p(1, np.sin(2)), DOWN)
+
+        label3 = MathTex('0.5\\sin(4x)', font_size=28, color=GREEN)
+        label3.next_to(axes.c2p(3, 0.5 * np.sin(12)), DOWN)
+
+        label4 = MathTex('\\cos(x)', font_size=28, color=YELLOW)
+        label4.next_to(axes.c2p(0, 1), UP, buff=0.5)
+
+        label5 = MathTex('e^{-|x|}\\sin(3x)', font_size=28, color=CYAN)
+        label5.next_to(axes.c2p(-2, np.exp(-0.6) * np.sin(-6)), UP)
+
+        self.play(
+            FadeIn(label1, shift=UP), 
+            FadeIn(label2, shift=DOWN), 
+            FadeIn(label3, shift=DOWN), 
+            FadeIn(label4, shift=UP), 
+            FadeIn(label5, shift=UP), 
+            run_time=1.5
+        )
+        
+        self.wait(1)
+
+        # 4. Geometric Shapes on the sides
+        triangle = Triangle(color=PURPLE, fill_opacity=0.5, stroke_width=4.0)
+        triangle.scale(0.8)
+        triangle.to_corner(UL)
+        
+        square = Square(side_length=1.5, color=ORANGE, fill_opacity=0.3, stroke_width=4.0)
+        square.to_corner(UR)
+        
+        self.play(
+            SpinInFromNothing(triangle), 
+            SpinInFromNothing(square), # Fixed spelling bug
+            run_time=1.0
+        )
+        
+        # 5. Final continuous rotation to look cool
+        self.play(
+            triangle.animate.rotate(PI),
+            square.animate.rotate(-PI),
+            run_time=2.0
+        )
+        
+        self.wait(2)
