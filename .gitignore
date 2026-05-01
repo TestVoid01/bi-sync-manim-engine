@@ -1,0 +1,26 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Mac OS files
+.DS_Store
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Bi-Sync Engine specific
+exports/
+media/
+*.mp4
+*.gif
+*.png
+
+# IDE / Editor files
+.vscode/
+.idea/
+
+# Logging
+*.log

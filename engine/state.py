@@ -70,6 +70,7 @@ class EngineState:
         # Key: mobject_id (int), Value: AABB bounding box tuple
         # Format: (min_x, min_y, max_x, max_y) in Manim math coords
         self._hitboxes: dict[int, tuple[float, float, float, float]] = {}
+        self._hitboxes_dirty: bool = True
 
         # ── Socket 3: Render Request Callback ──
         # Set by ManimCanvas to allow external code to trigger repaints.
@@ -83,6 +84,7 @@ class EngineState:
 
         # ── Scene Health (Black Screen Trap Prevention) ──
         self.scene_is_healthy: bool = True
+        self.is_external_reload_pending: bool = False
         self.render_state: str = self.RENDER_READY
         self.interaction_burst_active: bool = False
         self.interaction_session_state: str = self.STATE_IDLE
@@ -99,8 +101,13 @@ class EngineState:
         self._selection_callbacks: list[Callable[[Optional[str]], None]] = []
         
         # Isolation Mode
-        self.isolated_mobject_id: Optional[int] = None
+        self.isolated_mobject_key: Any = None
         self.isolated_mobject_path: list[int] = []
+
+        # ── Slice 6: Preview Drift Tracking ──
+        # Tracks live edits that could NOT be persisted to source.
+        # Export preflight checks this to warn the user.
+        self._preview_drift_reasons: list[str] = []
 
         logger.info("EngineState initialized with 5 sockets")
 
@@ -164,6 +171,7 @@ class EngineState:
 
     def request_render(self, dt: float = 0.0) -> None:
         """Request a new frame. Phase 2 calls this after code hot-swap."""
+        self._hitboxes_dirty = True
         if self._render_callback is not None:
             try:
                 self._render_callback(dt)
@@ -262,9 +270,17 @@ class EngineState:
 
     def set_selected_object(self, selection: Optional["SelectionRef"]) -> None:
         """Set canonical object selection payload and emit legacy name signal."""
+        old_object = self._selected_object
         self._selected_object = selection
         name = selection.display_name if selection is not None else None
+        old_name = self._selected_mobject_name
         self.set_selected_mobject_name(name)
+        if old_object is not selection and old_name == name:
+            for cb in self._selection_callbacks:
+                try:
+                    cb(name)
+                except Exception as e:
+                    logger.error(f"Selection callback failed: {e}")
 
     @property
     def selected_mobject_name(self) -> Optional[str]:
@@ -285,3 +301,48 @@ class EngineState:
         """Register a callback when an object is clicked/selected."""
         self._selection_callbacks.append(callback)
 
+    # ────────────────────────────────────────────────────────────
+    # Slice 6: Preview Drift Tracking
+    # ────────────────────────────────────────────────────────────
+
+    def record_preview_drift(self, reason: str) -> None:
+        """Record that a live edit could not be persisted to source.
+
+        Called by DragController / PropertyPanel when a no_persist
+        strategy is encountered but the live object was still updated
+        in-memory. Export preflight uses this to warn the user.
+        """
+        if reason and reason not in self._preview_drift_reasons:
+            self._preview_drift_reasons.append(reason)
+            logger.info("Preview drift recorded: %s", reason)
+
+    def clear_preview_drift(self) -> None:
+        """Reset drift tracking after a full reload aligns source and preview."""
+        if self._preview_drift_reasons:
+            logger.info(
+                "Cleared %d preview drift reason(s)", len(self._preview_drift_reasons)
+            )
+        self._preview_drift_reasons.clear()
+
+    @property
+    def has_preview_drift(self) -> bool:
+        """True when live preview may differ from what export would produce."""
+        return bool(self._preview_drift_reasons)
+
+    @property
+    def preview_drift_summary(self) -> str:
+        """Human-readable summary of all preview drift reasons."""
+        if not self._preview_drift_reasons:
+            return ""
+        lines = [
+            "The following live edits could not be saved to source code:",
+            "",
+        ]
+        for reason in self._preview_drift_reasons:
+            lines.append(f"  • {reason}")
+        lines.append("")
+        lines.append(
+            "The exported video will render from source code, so these "
+            "edits may not appear in the export."
+        )
+        return "\n".join(lines)

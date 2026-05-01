@@ -22,12 +22,16 @@ from __future__ import annotations
 
 import logging
 import traceback
+import time
+import numpy as np
 from typing import TYPE_CHECKING, Any, Optional
 
 import moderngl
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QMouseEvent, QCursor
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+from engine.runtime_provenance import reset_creation_tracking
+from engine.scene_loader import discover_scene_class
 
 if TYPE_CHECKING:
     from manim.scene.scene import Scene
@@ -36,6 +40,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("bisync.canvas")
 
+def _args_changed_helper(old_args, new_args):
+    """Helper for deep equality check of arguments (handles numpy arrays and floats)."""
+    if type(old_args) != type(new_args):
+        return True
+    if isinstance(old_args, (list, tuple)):
+        if len(old_args) != len(new_args):
+            return True
+        return any(_args_changed_helper(a, b) for a, b in zip(old_args, new_args))
+    if hasattr(old_args, 'shape') and hasattr(new_args, 'shape'):
+        if old_args.shape != new_args.shape: return True
+        return not np.allclose(old_args, new_args, atol=1e-6)
+    if isinstance(old_args, float) and isinstance(new_args, float):
+        return abs(old_args - new_args) > 1e-6
+    return old_args != new_args
 
 class ManimCanvas(QOpenGLWidget):
     """PyQt6 widget that renders Manim scenes via OpenGL Context Hijack.
@@ -87,6 +105,11 @@ class ManimCanvas(QOpenGLWidget):
 
         # Frame counter for diagnostics
         self._frame_count: int = 0
+
+        # Hover hit-test throttle: skip if cursor barely moved
+        self._last_hover_px: int = -999
+        self._last_hover_py: int = -999
+        self._last_hover_hit: bool = False
 
         # Drag controller (set externally by MainWindow)
         self._drag_controller = None
@@ -146,51 +169,43 @@ class ManimCanvas(QOpenGLWidget):
                 # FBO recreation on resize. This is a cheap GL query.
                 self._renderer.update_fbo()
                 
-                # --- PHASE 5 GHOST RENDERER LOGIC ---
                 anim_ref = self._engine_state.selected_animation
-                ghost_added = False
-                ghost_mob = None
                 
-                if anim_ref is not None and self._ast_mutator is not None:
-                    # Dynamic matching using AST bindings
-                    binding = self._ast_mutator.get_binding_by_name(anim_ref.target_var)
-                    if binding is not None:
-                        for mob in self._scene.mobjects:
-                            live_bind = self._ast_mutator.get_live_bind(id(mob))
-                            if live_bind and live_bind.variable_name == anim_ref.target_var:
-                                ghost_mob = mob.copy()
-                                break
-                        
-                        if ghost_mob is None:
-                            for mob in self._scene.mobjects:
-                                mob_type = type(mob).__name__
-                                if mob_type == binding.constructor_name:
-                                    ghost_mob = mob.copy()
-                                    break
-                                    
-                        if ghost_mob is not None:
-                            # Make it translucent
-                            if hasattr(ghost_mob, 'set_fill'):
-                                ghost_mob.set_fill(opacity=0.2)
-                            if hasattr(ghost_mob, 'set_stroke'):
-                                ghost_mob.set_stroke(opacity=0.3, width=2)
-                                
-                            # Try to apply target state
+                if anim_ref is None:
+                    # Clean up ghost if animation is deselected
+                    if getattr(self, '_cached_ghost_mob', None) is not None:
+                        if self._scene is not None:
                             try:
-                                method = getattr(ghost_mob, anim_ref.method_name)
-                                if len(anim_ref.args) > 0:
-                                    method(anim_ref.args[0])
-                                else:
-                                    method()
-                                self._scene.add(ghost_mob)
-                                ghost_added = True
-                            except Exception as e:
+                                self._scene.remove(self._cached_ghost_mob)
+                            except Exception:
                                 pass
+                        self._cached_ghost_mob = None
+                        self._cached_base_ghost = None
+                        self._cached_anim_key = None
+                        self._cached_anim_args = None
+                        self._cached_anim_method = None
+                else:
+                    # Ghost rendering is disabled to prevent "duplicate object" visual confusion.
+                    pass
                 
+                # Run all mobject updaters (always_redraw, etc.) every frame
+                # This keeps animations like orbit vectors, moving text, etc. alive
+                if self._scene is not None:
+                    try:
+                        current_time = time.monotonic()
+                        last_time = getattr(self, '_last_frame_time', current_time - 1.0/60.0)
+                        dt = current_time - last_time
+                        
+                        # Clamp dt to prevent massive jumps if the window is hidden/paused
+                        if dt > 0.1:
+                            dt = 1.0 / 60.0
+                            
+                        self._last_frame_time = current_time
+                        self._scene.update_mobjects(dt)
+                    except Exception as e:
+                        logger.debug(f"update_mobjects skipped: {e}")
+
                 self._renderer.update_frame(self._scene)
-                
-                if ghost_added and ghost_mob is not None:
-                    self._scene.remove(ghost_mob)
                     
             except Exception as e:
                 logger.error(f"Render error: {e}\n{traceback.format_exc()}")
@@ -227,35 +242,52 @@ class ManimCanvas(QOpenGLWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         """Handle mouse move — update drag position (SPSC overwrite)."""
-        if self._drag_controller is not None and self._drag_controller.is_dragging:
+        if (
+            self._drag_controller is not None
+            and (
+                self._drag_controller.is_dragging
+                or self._drag_controller.has_pending_drag_candidate
+            )
+        ):
             pos = event.position()
             self._drag_controller.on_mouse_move(int(pos.x()), int(pos.y()))
         else:
-            # Show open hand cursor when hovering over a hittable object
+            # Throttled hover cursor: only re-test if mouse moved ≥5px
             if self._drag_controller is not None:
                 pos = event.position()
-                mx, my = 0.0, 0.0
-                if self._coord_transformer:
-                    mx, my = self._coord_transformer.pixel_to_math(
-                        int(pos.x()), int(pos.y())
-                    )
-                hit_id = None
-                hitboxes = self._engine_state.get_hitboxes()
-                for mob_id, (x0, y0, x1, y1) in hitboxes.items():
-                    if x0 <= mx <= x1 and y0 <= my <= y1:
-                        hit_id = mob_id
-                        break
-                if hit_id is not None:
-                    self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
-                else:
-                    self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+                px, py = int(pos.x()), int(pos.y())
+                dx = abs(px - self._last_hover_px)
+                dy = abs(py - self._last_hover_py)
+                if dx >= 5 or dy >= 5:
+                    self._last_hover_px = px
+                    self._last_hover_py = py
+                    mx, my = 0.0, 0.0
+                    if self._coord_transformer:
+                        mx, my = self._coord_transformer.pixel_to_math(px, py)
+                    hit_found = False
+                    hitboxes = self._engine_state.get_hitboxes()
+                    for mob_id, (x0, y0, x1, y1) in hitboxes.items():
+                        if x0 <= mx <= x1 and y0 <= my <= y1:
+                            hit_found = True
+                            break
+                    if hit_found != self._last_hover_hit:
+                        self._last_hover_hit = hit_found
+                        if hit_found:
+                            self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+                        else:
+                            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
             super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         """Handle mouse release — finalize drag + AST save."""
-        if self._drag_controller is not None and self._drag_controller.is_dragging:
-            pos = event.position()
-            self._drag_controller.on_mouse_release(int(pos.x()), int(pos.y()))
+        if (
+            self._drag_controller is not None
+            and (
+                self._drag_controller.is_dragging
+                or self._drag_controller.has_pending_drag_candidate
+            )
+        ):
+            self._drag_controller.on_mouse_release()
             self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
         else:
             super().mouseReleaseEvent(event)
@@ -326,6 +358,7 @@ class ManimCanvas(QOpenGLWidget):
                 self._scene.setup()
             except Exception as e:
                 logger.warning(f"Scene.setup() issue (non-fatal): {e}")
+            reset_creation_tracking()
 
             # Patch scene.play() to capture animations instead of playing
             original_play = self._scene.play
@@ -337,43 +370,64 @@ class ManimCanvas(QOpenGLWidget):
                 def capturing_play(*animations, **kwargs):
                     """Intercept play() — capture animations, add mobjects."""
                     try:
-                        # Compile to proper Animation objects (handles .animate, raw mobjects, etc.)
+                        # Compile to proper Animation objects
                         if hasattr(scene_ref, 'compile_animations'):
                             compiled_anims = scene_ref.compile_animations(*animations, **kwargs)
                         else:
                             compiled_anims = animations
-                            
-                        player.capture_play_call(scene_ref, *compiled_anims, **kwargs)
+
+                        # 1. Add introducers / mobjects to the scene so they are visible
+                        for anim in compiled_anims:
+                            try:
+                                if hasattr(anim, "is_introducer") and anim.is_introducer():
+                                    mob = getattr(anim, 'mobject', None)
+                                    if mob is not None and mob not in scene_ref.mobjects:
+                                        scene_ref.add(mob)
+                                elif hasattr(anim, "add_to_back") and anim not in scene_ref.mobjects:
+                                    scene_ref.add(anim)
+                                else:
+                                    mob = getattr(anim, 'mobject', None)
+                                    if mob is not None and mob not in scene_ref.mobjects:
+                                        scene_ref.add(mob)
+                            except Exception as e:
+                                logger.error(f"Animation introducer error: {e}", exc_info=True)
+
+                        # 2. VBO pre-allocation
+                        try:
+                            self._renderer.update_frame(scene_ref)
+                        except Exception as e:
+                            logger.error(f"VBO pre-allocation error: {e}", exc_info=True)
+
+                        # 3. Snapshot BEFORE begin()
+                        state_snapshot = {id(m): m.copy() for m in scene_ref.mobjects}
+
+                        # 4. Initialize animations
+                        for anim in compiled_anims:
+                            anim.begin()
+
+                        # 5. Capture
+                        player.capture_play_call(scene_ref, compiled_anims, kwargs, state_snapshot)
+
+                        # 6. FAST-FORWARD: advance mobjects to their final state
+                        # so that subsequent code in construct() operates on completed mobjects.
+                        for anim in compiled_anims:
+                            try:
+                                anim.interpolate(1)
+                                anim.finish()
+                                anim.clean_up_from_scene(scene_ref)
+                            except Exception as e:
+                                logger.warning(f"Fast-forward error: {e}")
                     except Exception as e:
                         logger.warning(f"Animation capture error: {e}")
-                        compiled_anims = animations
-                        
-                    # Simply add the mobjects so they are registered in the scene's mobjects list.
-                    # We DO NOT fast-forward or finish the animations here, because doing so
-                    # permanently mutates the scene state (e.g. FadeOut removes them), 
-                    # making AnimationPlayer replay impossible.
-                    for anim in compiled_anims:
-                        try:
-                            if hasattr(anim, "is_introducer") and anim.is_introducer():
-                                mob = getattr(anim, 'mobject', None)
-                                if mob is not None and mob not in scene_ref.mobjects:
-                                    scene_ref.add(mob)
-                            elif hasattr(anim, "add_to_back") and anim not in scene_ref.mobjects:
-                                scene_ref.add(anim)
-                            # Fallback for standard animations
-                            else:
-                                mob = getattr(anim, 'mobject', None)
-                                if mob is not None and mob not in scene_ref.mobjects:
-                                    scene_ref.add(mob)
-                        except Exception as e:
-                            pass
 
                 def capturing_wait(duration=1, **kwargs):
                     """Intercept wait() — capture as a Wait animation."""
                     try:
                         from manim import Wait
                         w = Wait(duration=duration, **kwargs)
-                        player.capture_play_call(scene_ref, w, **kwargs)
+                        state_snapshot = {id(m): m.copy() for m in scene_ref.mobjects}
+                        w.begin()
+                        player.capture_play_call(scene_ref, [w], kwargs, state_snapshot)
                     except Exception as e:
                         logger.warning(f"Wait capture error: {e}")
 
@@ -473,31 +527,36 @@ class ManimCanvas(QOpenGLWidget):
         source_text: str,
         module_name: str,
         scene_file: str,
+        preferred_scene_name: Optional[str] = None,
     ) -> tuple[bool, str]:
         """Validate candidate scene code without mutating live preview."""
         try:
             import ast as ast_mod
-            from manim import Scene as BaseScene
 
             ast_mod.parse(source_text)
 
             compiled = compile(source_text, scene_file, "exec")
-            ns: dict[str, Any] = {}
+            ns: dict[str, Any] = {"__name__": module_name}
             exec("from manim import *", ns)
             exec(compiled, ns)
 
-            has_scene = any(
-                isinstance(obj, type) and issubclass(obj, BaseScene) and obj is not BaseScene
-                for obj in ns.values()
+            scene_class = discover_scene_class(
+                ns,
+                preferred_name=preferred_scene_name,
             )
-            if not has_scene:
+            if scene_class is None:
                 return False, f"no Scene subclass found in {module_name}"
 
             return True, "shadow validation passed"
         except Exception as exc:
             return False, str(exc)
 
-    def reload_scene_from_module(self, module_name: str, scene_file: str) -> bool:
+    def reload_scene_from_module(
+        self,
+        module_name: str,
+        scene_file: str,
+        preferred_scene_name: Optional[str] = None,
+    ) -> bool:
         """Full scene reload — destroys old scene, creates fresh one.
 
         Called when file structure changes (new objects, deleted objects).
@@ -536,6 +595,7 @@ class ManimCanvas(QOpenGLWidget):
             self._engine_state.clear_hitboxes()
             self._engine_state.selected_animation = None
             self._engine_state.set_selected_object(None)
+            self._engine_state.clear_preview_drift()
 
             # Clear object registry to prevent ghost references
             if hasattr(self._engine_state, 'object_registry'):
@@ -559,18 +619,10 @@ class ManimCanvas(QOpenGLWidget):
                 logger.info(f"Module imported: {module_name}")
 
             # Step 2: Find the Scene subclass in the reloaded module
-            from manim import Scene as BaseScene
-            new_scene_class = None
-            for attr_name in dir(module):
-                obj = getattr(module, attr_name)
-                if (
-                    isinstance(obj, type)
-                    and issubclass(obj, BaseScene)
-                    and obj is not BaseScene
-                ):
-                    new_scene_class = obj
-                    break
-
+            new_scene_class = discover_scene_class(
+                module,
+                preferred_name=preferred_scene_name,
+            )
             if new_scene_class is None:
                 logger.error("No Scene subclass found in reloaded module")
                 return False
@@ -595,6 +647,7 @@ class ManimCanvas(QOpenGLWidget):
                 self._scene.setup()
             except Exception as e:
                 logger.warning(f"Scene.setup() issue (non-fatal): {e}")
+            reset_creation_tracking()
 
             # Step 7: Patch play() for animation capture
             original_play = self._scene.play
@@ -612,28 +665,61 @@ class ManimCanvas(QOpenGLWidget):
                         else:
                             compiled_anims = animations
                             
-                        player.capture_play_call(scene_ref, *compiled_anims, **kwargs)
+                        # 1. Add introducers / mobjects to the scene so they are visible
+                        for anim in compiled_anims:
+                            try:
+                                if hasattr(anim, "is_introducer") and anim.is_introducer():
+                                    mob = getattr(anim, 'mobject', None)
+                                    if mob is not None and mob not in scene_ref.mobjects:
+                                        scene_ref.add(mob)
+                                elif hasattr(anim, "add_to_back") and anim not in scene_ref.mobjects:
+                                    scene_ref.add(anim)
+                                else:
+                                    mob = getattr(anim, 'mobject', None)
+                                    if mob is not None and mob not in scene_ref.mobjects:
+                                        scene_ref.add(mob)
+                            except Exception as e:
+                                logger.error(f"Animation introducer error (reload): {e}", exc_info=True)
+
+                        # 2. RUN DUMMY VBO PRE-ALLOCATION BEFORE BEGIN()
+                        try:
+                            self._renderer.update_frame(scene_ref)
+                        except Exception as e:
+                            logger.error(f"VBO pre-allocation error (reload): {e}", exc_info=True)
+
+                        # 3. Take snapshot exactly BEFORE begin()
+                        state_snapshot = {id(m): m.copy() for m in scene_ref.mobjects}
+
+                        # 4. Initialize animations
+                        for anim in compiled_anims:
+                            anim.begin()
+                            
+                        # 5. Capture play call properly
+                        player.capture_play_call(scene_ref, compiled_anims, kwargs, state_snapshot)
+
+                        # 6. FAST-FORWARD: advance mobjects to their final state
+                        for anim in compiled_anims:
+                            try:
+                                anim.interpolate(1)
+                                anim.finish()
+                                anim.clean_up_from_scene(scene_ref)
+                            except Exception as e:
+                                logger.warning(f"Fast-forward error in reload: {e}")
                     except Exception as e:
                         logger.warning(f"Animation capture error: {e}")
-                        compiled_anims = animations
-                        
-                    for anim in compiled_anims:
-                        try:
-                            if hasattr(anim, "is_introducer") and anim.is_introducer():
-                                mob = getattr(anim, 'mobject', None)
-                                if mob is not None and mob not in scene_ref.mobjects:
-                                    scene_ref.add(mob)
-                            elif hasattr(anim, "add_to_back") and anim not in scene_ref.mobjects:
-                                scene_ref.add(anim)
-                            else:
-                                mob = getattr(anim, 'mobject', None)
-                                if mob is not None and mob not in scene_ref.mobjects:
-                                    scene_ref.add(mob)
-                        except Exception:
-                            pass
+
+                def capturing_wait(duration=1, **kwargs):
+                    try:
+                        from manim import Wait
+                        w = Wait(duration=duration, **kwargs)
+                        state_snapshot = {id(m): m.copy() for m in scene_ref.mobjects}
+                        w.begin()
+                        player.capture_play_call(scene_ref, [w], kwargs, state_snapshot)
+                    except Exception as e:
+                        logger.warning(f"Wait capture error: {e}")
 
                 self._scene.play = capturing_play
-                self._scene.wait = lambda *a, **kw: None
+                self._scene.wait = capturing_wait
 
             # Step 8: Construct (wrapped — partial scenes are OK)
             try:
@@ -661,6 +747,8 @@ class ManimCanvas(QOpenGLWidget):
             )
 
             # Step 9: Emit for MainWindow re-wiring
+            if hasattr(self, '_last_frame_time'):
+                delattr(self, '_last_frame_time')
             self._engine_state.emit_scene_parsed()
 
             # Step 10: Force repaint

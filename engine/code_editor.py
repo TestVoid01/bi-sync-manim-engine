@@ -159,6 +159,7 @@ class CodeEditorPanel(QDockWidget):
         # Flag to prevent feedback loop:
         # True when we're programmatically updating text (sync_from_file)
         self._is_programmatic_change: bool = False
+        self._has_unapplied_draft: bool = False
 
         # Don't allow closing
         self.setFeatures(
@@ -261,7 +262,7 @@ class CodeEditorPanel(QDockWidget):
         """
         self._on_code_saved_callback = callback
 
-    def _on_debounce_save(self) -> None:
+    def _on_debounce_save(self) -> Optional[str]:
         """Called 500ms after the user stops typing. Saves to disk + reloads scene.
 
         Flow:
@@ -283,23 +284,36 @@ class CodeEditorPanel(QDockWidget):
                 ast_mod.parse(content)
             except SyntaxError as e:
                 logger.warning(f"Syntax error in editor, skipping save: {e}")
+                self._has_unapplied_draft = True
                 if self._file_watcher:
                     self._file_watcher.resume()
-                return
+                return "syntax_error"
 
             if self._on_code_saved_callback:
                 result = self._on_code_saved_callback(content)
                 if result and not getattr(result, "applied", True):
                     logger.warning(f"Shadow build rejected: {getattr(result, 'status', 'unknown')}")
+                    self._has_unapplied_draft = True
+                    return getattr(result, "error", None) or "shadow_build_failed"
                 else:
+                    applied_source = getattr(result, "applied_source", None) if result else None
+                    if applied_source is not None and applied_source != self._editor.toPlainText():
+                        self._is_programmatic_change = True
+                        self._editor.setPlainText(applied_source)
+                        self._is_programmatic_change = False
+                    self._has_unapplied_draft = False
                     logger.info("Code Editor → shadow build accepted & saved")
             else:
                 # Fallback: write to file and at least repaint
                 Path(self._scene_file).write_text(content, encoding="utf-8")
+                self._has_unapplied_draft = False
                 self._engine_state.request_render()
+            return None
 
         except Exception as e:
             logger.error(f"Code Editor save failed: {e}")
+            self._has_unapplied_draft = True
+            return str(e)
         finally:
             # Resume file watcher after a short delay
             QTimer.singleShot(400, self._resume_watcher)
@@ -319,6 +333,8 @@ class CodeEditorPanel(QDockWidget):
         another save (which would create an infinite loop).
         """
         try:
+            if self._has_unapplied_draft:
+                return
             content = Path(self._scene_file).read_text(encoding="utf-8")
             current = self._editor.toPlainText()
 
@@ -355,7 +371,7 @@ class CodeEditorPanel(QDockWidget):
         try:
             if self._save_timer.isActive():
                 self._save_timer.stop()
-                self._on_debounce_save()
+                return self._on_debounce_save()
             return None
         except Exception as e:
             logger.error(f"Code Editor flush failed: {e}")

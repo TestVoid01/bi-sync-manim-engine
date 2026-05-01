@@ -32,6 +32,10 @@ from manim.renderer.opengl_renderer import OpenGLRenderer
 from manim.mobject.opengl.opengl_mobject import OpenGLMobject
 from manim.mobject.opengl.opengl_vectorized_mobject import OpenGLVMobject
 
+# Maximum depth for recursive hitbox extraction to avoid traversing
+# thousands of leaf nodes in complex scenes (e.g., NumberPlane).
+_HITBOX_MAX_DEPTH = 4
+
 if TYPE_CHECKING:
     from manim.scene.scene import Scene
     from engine.state import EngineState
@@ -69,6 +73,15 @@ class NullFileWriter:
     def save_image(self, *args: Any, **kwargs: Any) -> None:
         pass
 
+    def __getattr__(self, name: str) -> Any:
+        # Fallback: silently absorb any other method calls from Manim
+        # (like add_partial_movie_file, is_already_cached, etc.)
+        def method(*args, **kwargs):
+            if name == "is_already_cached":
+                return False
+            return None
+        return method
+
 
 class _NullSection:
     """Stub for SceneFileWriter.sections entries."""
@@ -95,6 +108,7 @@ class HijackedRenderer(OpenGLRenderer):
     def __init__(self, engine_state: Optional[EngineState] = None, **kwargs: Any) -> None:
         # Use NullFileWriter to prevent all file I/O
         super().__init__(file_writer_class=NullFileWriter, **kwargs)
+        self.window = None
         self._external_ctx: moderngl.Context | None = None
         self._engine_state = engine_state
         logger.info("HijackedRenderer created (NullFileWriter active)")
@@ -199,54 +213,92 @@ class HijackedRenderer(OpenGLRenderer):
             self.frame_buffer_object = self._external_ctx.detect_framebuffer()
 
     def update_frame(self, scene: Scene) -> None:
-        """Override: Clear hitboxes before rendering, then populate them.
-
-        Extends Manim's update_frame to:
-        1. Clear Socket 2 hitbox dict at frame start
-        2. Call parent update_frame (which calls render_mobject per object)
-        3. Hitboxes are populated by our render_mobject override
-        """
-        # Clear hitboxes for this frame
-        if self._engine_state is not None:
+        """Override: Clear hitboxes before rendering, then populate them."""
+        # Only rebuild hitboxes when something actually changed (drag, reload, etc.)
+        _rebuilding_hitboxes = False
+        if self._engine_state is not None and self._engine_state._hitboxes_dirty:
             self._engine_state.clear_hitboxes()
+            _rebuilding_hitboxes = True
 
-        # Call Manim's original update_frame
-        # (which calls render_mobject for each visible mobject)
+        # Force should_render = True for ALL mobjects.
+        # Manim's update_frame() skips mobjects where should_render is False.
+        # ParametricFunction (from axes.plot) has a property that returns False
+        # after Create animation modifies points. Writing to __dict__ shadows
+        # any property/descriptor on the class, guaranteeing True.
+        for mobject in scene.mobjects:
+            for sub in mobject.get_family() if hasattr(mobject, 'get_family') else [mobject]:
+                try:
+                    sub.__dict__['should_render'] = True
+                except Exception:
+                    pass
+
+        # Call Manim's original update_frame — this calls render_mobject() for each object
         super().update_frame(scene)
 
-    def render_mobject(self, mobject: OpenGLMobject | OpenGLVMobject) -> None:
-        """Override: Render mobject AND extract its AABB for Socket 2.
+        # Mark hitboxes clean AFTER all render_mobject() calls have populated them
+        if _rebuilding_hitboxes and self._engine_state is not None:
+            self._engine_state._hitboxes_dirty = False
 
-        After Manim renders the mobject's shaders, we compute its
-        Axis-Aligned Bounding Box (AABB) in Manim math coordinates
-        and push it to EngineState.push_hitbox().
+    def _extract_hitbox_single(self, mob: Any) -> None:
+        """Extract AABB hitbox for a single mobject (no recursion)."""
+        try:
+            force_rebuild = getattr(self._engine_state, '_hitboxes_dirty', False)
+            needs_new = getattr(mob, 'needs_new_bounding_box', True) or force_rebuild
+            if not needs_new and hasattr(mob, '_bisync_hitbox_cache'):
+                box = mob._bisync_hitbox_cache
+                if box is not None:
+                    self._engine_state.push_hitbox(id(mob), box)
+            else:
+                min_x = float(mob.get_left()[0])
+                max_x = float(mob.get_right()[0])
+                min_y = float(mob.get_bottom()[1])
+                max_y = float(mob.get_top()[1])
 
-        Phase 3's Mouse Ray-Caster will use these hitboxes for
-        click detection without expensive mesh intersection.
-
-        The AABB is computed from the mobject's points array,
-        which is already in Manim's coordinate space.
-        """
-        # Let Manim do the actual GPU rendering
-        super().render_mobject(mobject)
-
-        # Extract AABB for hit-testing (Socket 2)
-        if self._engine_state is not None:
-            try:
-                import numpy as np
-                min_x = float(mobject.get_left()[0])
-                max_x = float(mobject.get_right()[0])
-                min_y = float(mobject.get_bottom()[1])
-                max_y = float(mobject.get_top()[1])
-                
-                # Ignore invalid or empty bounding boxes
+                box = None
                 if not (np.isnan(min_x) or np.isnan(min_y) or np.isnan(max_x) or np.isnan(max_y)):
-                    # Expand hitbox slightly for easier clicking on thin objects (like text or lines)
                     padding = 0.1
-                    self._engine_state.push_hitbox(
-                        id(mobject),
-                        (min_x - padding, min_y - padding, max_x + padding, max_y + padding),
-                    )
-            except Exception:
-                # Don't let hitbox extraction crash the render pipeline
-                pass
+                    box = (min_x - padding, min_y - padding, max_x + padding, max_y + padding)
+                    self._engine_state.push_hitbox(id(mob), box)
+
+                mob._bisync_hitbox_cache = box
+        except Exception:
+            pass
+
+    def _extract_hitbox_recursive(self, mob: Any, depth: int = 0) -> None:
+        """Extract AABB hitboxes for a mobject AND its children (depth-limited).
+
+        Only used for the currently isolated mobject so that its internal
+        children become individually clickable.
+        """
+        self._extract_hitbox_single(mob)
+
+        if depth < _HITBOX_MAX_DEPTH:
+            subs = getattr(mob, 'submobjects', None)
+            if subs:
+                for sub in subs:
+                    self._extract_hitbox_recursive(sub, depth + 1)
+
+    def render_mobject(self, mobject: OpenGLMobject | OpenGLVMobject) -> None:
+        """Override: Render mobject AND extract its AABB for Socket 2."""
+        if not hasattr(mobject, "get_shader_wrapper_list"):
+            return
+
+        try:
+            super().render_mobject(mobject)
+        except Exception as e:
+            mob_type = type(mobject).__name__
+            logger.warning(f"render_mobject failed for {mob_type}: {e}")
+            for sub in getattr(mobject, 'submobjects', []):
+                try:
+                    if hasattr(sub, 'get_shader_wrapper_list'):
+                        super().render_mobject(sub)
+                except Exception:
+                    pass
+
+        # Extract AABB for hit-testing (Socket 2) — only when hitboxes need rebuilding
+        if self._engine_state is not None and self._engine_state._hitboxes_dirty:
+            mob_key = getattr(mobject, '_bisync_line_number', id(mobject))
+            if getattr(self._engine_state, 'isolated_mobject_key', None) == mob_key:
+                self._extract_hitbox_recursive(mobject)
+            else:
+                self._extract_hitbox_single(mobject)

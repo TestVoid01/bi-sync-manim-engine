@@ -52,6 +52,7 @@ class PropertySpec:
     display_key: str = ""
     param_ref: Any = None
     semantic_group: str = "generic"
+    apply_mode: str = "read_only"
     live_safe: bool = False
     source_key: Optional[str] = None
     backing_lane: str = "source"
@@ -97,8 +98,10 @@ class PropertyInspector:
             return []
 
         binding = (
-            self._ast_mutator.get_binding_by_source_key(selection.source_key)
-            if selection.source_key
+            self._ast_mutator.get_binding_by_source_key(
+                selection.nearest_editable_source_key or selection.source_key
+            )
+            if (selection.nearest_editable_source_key or selection.source_key)
             else self._ast_mutator.get_binding_by_name(selection.variable_name)
         )
         live_mobject = self._resolve_live_mobject(selection)
@@ -189,6 +192,19 @@ class PropertyInspector:
             live_safe=decision.live_safe,
             binding=binding,
         )
+        unsupported_reason = self._unsupported_ast_edit_reason(
+            param_ref=param_ref,
+            widget_hint=widget_hint,
+        )
+        read_only = (
+            (binding is not None and binding.editability != "source_editable")
+            or unsupported_reason is not None
+        )
+        read_only_reason = (
+            binding.read_only_reason
+            if binding is not None and binding.editability != "source_editable"
+            else unsupported_reason or ""
+        )
 
         range_hint = self._range_hint_for(display_name, normalized_value, param_ref.owner_kind)
 
@@ -200,7 +216,7 @@ class PropertyInspector:
             source=param_ref.owner_kind,
             widget_hint=widget_hint,
             section=section,
-            apply_strategy=apply_strategy,
+            apply_strategy="read_only" if read_only else apply_strategy,
             range_hint=range_hint,
             options=options,
             owner_kind=param_ref.owner_kind,
@@ -214,15 +230,12 @@ class PropertyInspector:
             display_key=display_key,
             param_ref=param_ref,
             semantic_group=decision.semantic_group,
+            apply_mode=decision.apply_mode,
             live_safe=decision.live_safe,
             source_key=binding.source_key if binding is not None else None,
             backing_lane="source",
-            read_only=(
-                binding is not None and binding.editability != "source_editable"
-            ),
-            read_only_reason=(
-                binding.read_only_reason if binding is not None else ""
-            ),
+            read_only=read_only,
+            read_only_reason=read_only_reason,
         )
 
     def _build_live_specs(
@@ -306,6 +319,10 @@ class PropertyInspector:
         binding: SceneNodeRef | None,
         selection: SelectionRef,
     ) -> Optional[PropertySpec]:
+        selected_source_key = (
+            getattr(selection, "nearest_editable_source_key", None)
+            or getattr(selection, "source_key", None)
+        )
         normalized = self._normalize_live_value(value)
         if normalized is None:
             return None
@@ -329,27 +346,36 @@ class PropertyInspector:
             plan_persistence(
                 selection.variable_name,
                 name,
-                source_key=selection.source_key,
+                source_key=selected_source_key,
                 path=tuple(selection.path),
             )
-            if selection.source_key is not None and callable(plan_persistence)
+            if selected_source_key is not None and callable(plan_persistence)
             else None
         )
         reliable_source_write = (
             persistence_strategy is not None and not persistence_strategy.no_persist
         )
+        selected_path = tuple(getattr(selection, "path", ()) or ())
+        binding_path = tuple(getattr(binding, "inline_path", ()) or ())
+        exact_source_path = selected_path == binding_path
         live_read_only = (
             selection.editability != "source_editable"
-            or selection.source_key is None
+            or selected_source_key is None
             or decision.read_only
+            or not exact_source_path
+            or (decision.live_safe and not reliable_source_write)
         )
         if live_read_only and widget_hint == "slider":
             widget_hint = "text"
 
-        if selection.editability != "source_editable" or selection.source_key is None:
+        if selection.editability != "source_editable" or selected_source_key is None:
             read_only_reason = selection.read_only_reason or "live readout only"
+        elif not exact_source_path:
+            read_only_reason = "live readout only"
         elif decision.read_only:
             read_only_reason = decision.reason
+        elif decision.live_safe and not reliable_source_write:
+            read_only_reason = "live readout only; no reliable source-backed write path"
         else:
             read_only_reason = ""
 
@@ -366,8 +392,9 @@ class PropertyInspector:
             options=options,
             display_key=decision.display_name,
             semantic_group=decision.semantic_group,
+            apply_mode=decision.apply_mode,
             live_safe=decision.live_safe,
-            source_key=selection.source_key,
+            source_key=selected_source_key,
             backing_lane="live",
             read_only=live_read_only,
             read_only_reason=read_only_reason,
@@ -385,6 +412,12 @@ class PropertyInspector:
     ) -> str:
         if binding is not None and binding.editability != "source_editable":
             return "read_only"
+        if unsupported_reason := self._unsupported_ast_edit_reason(
+            param_ref=param_ref,
+            widget_hint=widget_hint,
+        ):
+            del unsupported_reason
+            return "read_only"
         if param_ref.owner_kind != "constructor":
             return "ast_reload"
         if widget_hint in {"tuple", "code"}:
@@ -396,6 +429,18 @@ class PropertyInspector:
         if self._has_live_write_path(live_mobject, display_name, self._collect_constructor_params(live_mobject)):
             return "hot_or_ast"
         return "ast_reload"
+
+    def _unsupported_ast_edit_reason(
+        self,
+        *,
+        param_ref: ASTParamRef,
+        widget_hint: str,
+    ) -> Optional[str]:
+        if param_ref.owner_kind != "constructor":
+            return "source chain editing is not yet enabled in the property panel"
+        # tuple and code widget hints are now supported via PropertyTupleEditor
+        # and PropertyCodeField — they persist through AST reload.
+        return None
 
     def _has_live_write_path(
         self,
@@ -551,7 +596,15 @@ class PropertyInspector:
         if selection.source_key:
             live_mobject = self._object_registry.find_mobject_by_source_key(
                 scene,
-                selection.source_key,
+                selection.exact_source_key or selection.source_key,
+            )
+            if live_mobject is not None:
+                return live_mobject
+
+        if selection.source_key:
+            live_mobject = self._object_registry.find_mobject_by_source_key(
+                scene,
+                selection.nearest_editable_source_key or selection.source_key,
             )
             if live_mobject is not None:
                 return live_mobject

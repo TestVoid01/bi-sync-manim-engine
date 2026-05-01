@@ -17,6 +17,7 @@ every frame, so they're always up-to-date.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 logger = logging.getLogger("bisync.hit_tester")
@@ -24,6 +25,21 @@ logger = logging.getLogger("bisync.hit_tester")
 if TYPE_CHECKING:
     from engine.state import EngineState
     from engine.ast_mutator import ASTMutator, ASTNodeRef
+
+
+@dataclass
+class HitResult:
+    top_level_mobject_id: int
+    selected_mobject_id: int
+    variable_name: Optional[str]
+    line_number: Optional[int]
+    source_key: Optional[str] = None
+    editability: str = "live_read_only"
+    read_only_reason: str = ""
+    path: tuple[int, ...] = ()
+    display_name: str = ""
+    registry_backed: bool = False
+    constructor_name: str = ""
 
 
 class HitTester:
@@ -41,7 +57,7 @@ class HitTester:
         self._ast_mutator = ast_mutator
         logger.info("HitTester initialized")
 
-    def test(self, math_x: float, math_y: float) -> Optional[int]:
+    def test(self, math_x: float, math_y: float) -> list[int]:
         """Test a math coordinate against all hitboxes.
 
         Args:
@@ -49,30 +65,22 @@ class HitTester:
             math_y: Y in Manim math coordinates
 
         Returns:
-            mobject_id (Python id()) of the hit object, or None
+            List of mobject_ids (Python id()) of the hit objects, sorted by area (smallest first).
         """
         hitboxes = self._engine_state.get_hitboxes()
         if not hitboxes:
-            return None
+            return []
 
-        best_id: Optional[int] = None
-        best_area: float = float("inf")
+        hits = []
 
         for mob_id, (min_x, min_y, max_x, max_y) in hitboxes.items():
             # AABB containment test
             if min_x <= math_x <= max_x and min_y <= math_y <= max_y:
-                # Prefer smallest bounding box (most specific object)
                 area = (max_x - min_x) * (max_y - min_y)
-                if area < best_area:
-                    best_area = area
-                    best_id = mob_id
+                hits.append((area, mob_id))
 
-        if best_id is not None:
-            pass
-
-
-
-        return best_id
+        hits.sort(key=lambda x: x[0])
+        return [h[1] for h in hits]
 
     def find_mobject_and_path(self, mobject_id: int, scene: Any) -> Optional[tuple[Any, Any, list[int]]]:
         """Find the top-level Mobject, the hit sub-mobject, and its index path.
@@ -113,14 +121,17 @@ class HitTester:
         return None
 
     def get_ast_ref(self, mobject: Any) -> Optional[ASTNodeRef]:
-        if not hasattr(mobject, "_bisync_line_number"):
-            pass
+        source_file = getattr(mobject, "_bisync_source_file", None)
+        line_num = getattr(mobject, "_bisync_line_number", None)
+        occurrence = getattr(mobject, "_bisync_occurrence", None)
+        if line_num is None:
             return None
-            
-        line_num = mobject._bisync_line_number
+        get_binding_by_runtime_marker = getattr(self._ast_mutator, "get_binding_by_runtime_marker", None)
+        if callable(get_binding_by_runtime_marker):
+            ref = get_binding_by_runtime_marker(source_file, line_num, occurrence)
+            if ref is not None:
+                return ref
         ref = self._ast_mutator.bindings.get(line_num)
-        if ref is None:
-            pass
         return ref
 
     def get_variable_name(self, mobject: Any) -> Optional[str]:

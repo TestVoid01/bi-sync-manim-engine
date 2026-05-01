@@ -63,6 +63,20 @@ FORMAT_OPTIONS = {
 }
 
 
+def build_export_command(settings: dict) -> list[str]:
+    return [
+        "manim", "render",
+        settings["scene_file"],
+        settings["scene_name"],
+        "--renderer", "cairo",
+        "--format", settings["format"],
+        "--fps", str(settings["fps"]),
+        "-r", f"{settings['width']},{settings['height']}",
+        "--output_file", os.path.basename(settings["output_path"]),
+        "--media_dir", os.path.dirname(settings["output_path"]),
+    ]
+
+
 class ExportDialog(QDialog):
     """Modal dialog for configuring video export settings."""
 
@@ -291,18 +305,7 @@ class ExportWorker(QThread):
         # EXPORT: Uses Cairo renderer (CPU-based, 100% accurate)
         # This "Draft Mode" separation is intentional — live preview is
         # for interactive editing, export is for final output.
-        cmd = [
-            "manim", "render",
-            scene_file,
-            "AdvancedScene",
-            "--renderer", "cairo",
-            "--format", s["format"],
-            "--fps", str(s["fps"]),
-            "-r", f"{s['width']},{s['height']}",
-            "--output_file", os.path.basename(output_path),
-            "--media_dir", os.path.dirname(output_path),
-            "--disable_caching",
-        ]
+        cmd = build_export_command(s)
 
         logger.info(f"Export command: {' '.join(cmd)}")
         self.progress.emit(0, "Starting Manim renderer...")

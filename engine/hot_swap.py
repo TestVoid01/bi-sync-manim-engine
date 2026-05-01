@@ -30,6 +30,10 @@ import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
+import numpy as np
+from engine.property_policy import is_visual_property
+from engine.scene_loader import discover_scene_class, module_name_from_path
+
 logger = logging.getLogger("bisync.hot_swap")
 
 if TYPE_CHECKING:
@@ -54,7 +58,11 @@ class HotSwapInjector:
         self._scene_file: Optional[Path] = None
         self._current_scene: Optional[Scene] = None
         self._ast_mutator = None
+        self._animation_player = None
         logger.info("HotSwapInjector initialized")
+
+    def set_animation_player(self, player: Any) -> None:
+        self._animation_player = player
 
     def set_ast_mutator(self, mutator: Any) -> None:
         self._ast_mutator = mutator
@@ -69,6 +77,12 @@ class HotSwapInjector:
         self._current_scene = scene
         self._scene_file = Path(scene_file)
         logger.info(f"Hot-swap target: {self._scene_file.name}")
+
+    @staticmethod
+    def can_fast_apply_property(prop_name: str, value: Any = None) -> bool:
+        """Return True only for visual properties with stable live semantics."""
+        del value
+        return is_visual_property(prop_name)
 
     def reload_from_file(self, file_path: str | Path | None = None) -> bool:
         """Reload the scene from a modified .py file.
@@ -98,26 +112,25 @@ class HotSwapInjector:
             # Step 1: Read new source
             source = path.read_text(encoding="utf-8")
 
+            if self._ast_mutator is not None:
+                # Update AST Mutator with the new code so bindings match the fresh line numbers.
+                # This injects the persistent bisync_uuid (variable name) for the new objects.
+                self._ast_mutator.parse_source_text(path, source)
+
             # Step 2: Compile and exec in isolated namespace
             code = compile(source, str(path), "exec")
-            isolated_ns: dict[str, Any] = {}
+            module_name = module_name_from_path(path, project_root=path.parent.parent)
+            isolated_ns: dict[str, Any] = {"__name__": module_name}
 
             # Import manim into the namespace so Scene classes work
             exec("from manim import *", isolated_ns)
             exec(code, isolated_ns)
 
             # Step 3: Find the Scene class
-            scene_class = None
-            from manim import Scene as BaseScene
-            for name, obj in isolated_ns.items():
-                if (
-                    isinstance(obj, type)
-                    and issubclass(obj, BaseScene)
-                    and obj is not BaseScene
-                ):
-                    scene_class = obj
-                    break
-
+            scene_class = discover_scene_class(
+                isolated_ns,
+                preferred_name=type(self._current_scene).__name__,
+            )
             if scene_class is None:
                 logger.error("No Scene subclass found in reloaded file")
                 return False
@@ -128,19 +141,36 @@ class HotSwapInjector:
             # Initialize minimal scene state for construct()
             temp_scene.mobjects = []
             temp_scene.animations = []
+            temp_scene.updaters = []
+            if hasattr(self._current_scene, "camera"):
+                temp_scene.camera = self._current_scene.camera
+            if hasattr(self._current_scene, "renderer"):
+                temp_scene.renderer = self._current_scene.renderer
 
             # Manually call construct to populate mobjects
             try:
-                # Patch self.add to capture mobjects
+                # Patch self.add and self.play to capture mobjects
                 added_mobjects = []
-                original_add = None
-                if hasattr(temp_scene, 'add'):
-                    original_add = temp_scene.add
-
+                
                 def capture_add(*mobjects, **kwargs):
                     added_mobjects.extend(mobjects)
+                
+                def capture_play(*animations, **kwargs):
+                    # In Manim, play() adds mobjects to the scene
+                    # We need to extract them from the animations
+                    for anim in animations:
+                        # Handles .animate, Animation objects, and raw mobjects
+                        if hasattr(anim, "mobject"):
+                            if anim.mobject not in added_mobjects:
+                                added_mobjects.append(anim.mobject)
+                        elif hasattr(anim, "add_to_back"): # Raw mobject
+                            if anim not in added_mobjects:
+                                added_mobjects.append(anim)
 
                 temp_scene.add = capture_add
+                temp_scene.play = capture_play
+                temp_scene.wait = lambda *a, **k: None
+                
                 temp_scene.construct()
             except Exception as e:
                 logger.warning(f"Temp scene construct error: {e}")
@@ -187,15 +217,35 @@ class HotSwapInjector:
         existing = list(self._current_scene.mobjects)
         matched_count = 0
 
-        # Try matching by line number first (robust against reordering)
+        # Try matching by bisync_uuid (AST-based provenance) first
         unmatched_new = []
         matched_old_ids: set[int] = set()
 
         for new_mob in new_mobjects:
             new_line = getattr(new_mob, '_bisync_line_number', None)
+            new_uuid = None
+            if new_line is not None and self._ast_mutator is not None:
+                new_ref = self._ast_mutator.get_binding_by_line(new_line)
+                if new_ref is not None:
+                    new_uuid = getattr(new_ref, 'bisync_uuid', None)
+
             matched = False
 
-            if new_line is not None:
+            # Strategy 1: Match by AST-injected UUID (robust against reordering/side-effects)
+            if new_uuid is not None and self._ast_mutator is not None:
+                for old_mob in existing:
+                    if id(old_mob) in matched_old_ids:
+                        continue
+                    old_ref = self._ast_mutator.get_live_bind(id(old_mob))
+                    if old_ref is not None and getattr(old_ref, 'bisync_uuid', None) == new_uuid and type(old_mob) == type(new_mob):
+                        self._copy_properties(old_mob, new_mob)
+                        matched_old_ids.add(id(old_mob))
+                        matched_count += 1
+                        matched = True
+                        break
+
+            # Strategy 2: Fallback to _bisync_line_number (for dynamically created objects)
+            if not matched and new_line is not None:
                 for old_mob in existing:
                     if id(old_mob) in matched_old_ids:
                         continue
@@ -243,12 +293,16 @@ class HotSwapInjector:
                 old_center = old_mob.get_center()
                 if not all(abs(a - b) < 1e-6 for a, b in zip(new_center, old_center)):
                     old_mob.move_to(new_center)
+                    if self._animation_player is not None:
+                        self._animation_player.update_snapshot(old_mob, lambda m, c=new_center: m.move_to(c))
 
             # Copy color
             if hasattr(new_mob, 'color') and hasattr(old_mob, 'set_color'):
                 try:
                     if str(new_mob.color) != str(old_mob.color):
                         old_mob.set_color(new_mob.color)
+                        if self._animation_player is not None:
+                            self._animation_player.update_snapshot(old_mob, lambda m, c=new_mob.color: m.set_color(c))
                 except Exception:
                     pass
 
@@ -258,6 +312,8 @@ class HotSwapInjector:
                 old_opacity = old_mob.get_fill_opacity()
                 if abs(new_opacity - old_opacity) > 1e-6:
                     old_mob.set_fill(opacity=new_opacity)
+                    if self._animation_player is not None:
+                        self._animation_player.update_snapshot(old_mob, lambda m: m.set_fill(opacity=new_opacity))
 
             # Copy stroke opacity
             if hasattr(new_mob, 'get_stroke_opacity') and hasattr(old_mob, 'set_stroke'):
@@ -265,34 +321,39 @@ class HotSwapInjector:
                 old_opacity = old_mob.get_stroke_opacity()
                 if abs(new_opacity - old_opacity) > 1e-6:
                     old_mob.set_stroke(opacity=new_opacity)
+                    if self._animation_player is not None:
+                        self._animation_player.update_snapshot(old_mob, lambda m: m.set_stroke(opacity=new_opacity))
 
-            # Copy scale (via width comparison for shapes with width)
-            if hasattr(new_mob, 'width') and hasattr(old_mob, 'width'):
-                if old_mob.width > 0 and abs(new_mob.width - old_mob.width) > 1e-6:
-                    scale_factor = new_mob.width / old_mob.width
-                    old_mob.scale(scale_factor)
+            # Deliberately do not copy geometry by scaling. Geometry/layout changes
+            # must go through full reload so transformed objects do not drift.
 
-            # --- GENERIC REFLECTION FALLBACK ---
-            for attr_name in dir(new_mob):
-                if attr_name.startswith('_') or callable(getattr(new_mob, attr_name)):
-                    continue
-                if hasattr(old_mob, attr_name):
-                    try:
-                        new_val = getattr(new_mob, attr_name)
-                        old_val = getattr(old_mob, attr_name)
-                        if type(new_val) == type(old_val):
-                            if type(new_val).__name__ == 'ndarray':
-                                import numpy as np
-                                if not np.array_equal(new_val, old_val):
-                                    setattr(old_mob, attr_name, new_val)
-                            elif new_val != old_val:
-                                setattr(old_mob, attr_name, new_val)
-                                pass
-                    except Exception:
-                        pass
+            # --- TARGETED VISUAL ATTRIBUTE SYNC ---
+            # Only sync known visual attributes instead of iterating dir()
+            # which returns 500+ entries on Manim objects and is extremely slow.
+            _VISUAL_ATTRS = (
+                'fill_color', 'fill_opacity', 'stroke_color', 'stroke_opacity',
+                'stroke_width', 'sheen_direction', 'sheen_factor',
+                'background_stroke_color', 'background_stroke_opacity',
+                'background_stroke_width',
+            )
+            for attr_name in _VISUAL_ATTRS:
+                try:
+                    new_val = getattr(new_mob, attr_name, None)
+                    old_val = getattr(old_mob, attr_name, None)
+                    if new_val is None or old_val is None:
+                        continue
+                    if type(new_val) != type(old_val):
+                        continue
+                    if isinstance(new_val, np.ndarray):
+                        if not np.array_equal(new_val, old_val):
+                            setattr(old_mob, attr_name, new_val)
+                    elif new_val != old_val:
+                        setattr(old_mob, attr_name, new_val)
+                except Exception:
+                    pass
 
         except Exception as e:
-            pass
+            logger.error(f"Error copying properties during hot-swap: {e}")
 
     def apply_transform(self, target_var: str, method_name: str, value: float) -> bool:
         """Apply a transform method (like scale) directly to the mobject.
@@ -327,6 +388,10 @@ class HotSwapInjector:
         if self._current_scene is None:
             return False
 
+        if not self.can_fast_apply_property(prop_name, new_value):
+            logger.info("Live hot-apply refused for geometry/code property: %s", prop_name)
+            return False
+
         mob = self._find_mobject_by_variable(target_var)
         if mob is not None:
             return self._apply_property_to_mob(mob, prop_name, new_value)
@@ -339,9 +404,8 @@ class HotSwapInjector:
 
         Resolution order (most reliable first):
         1. ObjectRegistry lookup (if available)
-        2. AST live_binds lookup
+        2. AST live_binds lookup (includes submobject walk)
         3. _bisync_line_number matching via AST bindings
-        4. Submobject walk (for deeply nested objects)
 
         Returns the live mobject or None.
         """
@@ -358,22 +422,7 @@ class HotSwapInjector:
                     return found
 
         # Strategy 2: AST live_binds (mobject_id → variable mapping)
-        if self._ast_mutator is not None:
-            for mob in self._current_scene.mobjects:
-                live_bind = self._ast_mutator.get_live_bind(id(mob))
-                if live_bind is not None and live_bind.variable_name == target_var:
-                    return mob
-
-        # Strategy 3: Match via _bisync_line_number from AST bindings
-        if self._ast_mutator is not None:
-            binding = self._ast_mutator.get_binding_by_name(target_var)
-            if binding is not None:
-                target_line = binding.line_number
-                for mob in self._current_scene.mobjects:
-                    if getattr(mob, '_bisync_line_number', None) == target_line:
-                        return mob
-
-        # Strategy 4: Walk all mobjects including submobjects
+        # Also walks one level of submobjects for nested objects.
         if self._ast_mutator is not None:
             for mob in self._current_scene.mobjects:
                 live_bind = self._ast_mutator.get_live_bind(id(mob))
@@ -384,6 +433,15 @@ class HotSwapInjector:
                     if sub_bind is not None and sub_bind.variable_name == target_var:
                         return sub
 
+        # Strategy 3: Match via _bisync_line_number from AST bindings
+        if self._ast_mutator is not None:
+            binding = self._ast_mutator.get_binding_by_name(target_var)
+            if binding is not None:
+                target_line = binding.line_number
+                for mob in self._current_scene.mobjects:
+                    if getattr(mob, '_bisync_line_number', None) == target_line:
+                        return mob
+
         return None
 
     def _apply_property_to_mob(
@@ -392,6 +450,7 @@ class HotSwapInjector:
         """Apply a specific property to a mobject."""
         try:
             if prop_name == "radius" and hasattr(mob, 'width'):
+                return False
                 # Circle radius → scale to new radius
                 current_radius = mob.width / 2.0
                 if current_radius > 0 and abs(value - current_radius) > 1e-6:
@@ -400,6 +459,7 @@ class HotSwapInjector:
                     return True
 
             elif prop_name == "side_length" and hasattr(mob, 'width'):
+                return False
                 current_side = mob.width
                 if current_side > 0 and abs(value - current_side) > 1e-6:
                     mob.scale(value / current_side)
@@ -426,6 +486,7 @@ class HotSwapInjector:
                 return self._apply_color(mob, value)
 
             elif prop_name == "font_size":
+                return False
                 if hasattr(mob, 'font_size'):
                     mob.font_size = value
                     # In Manim, changing font_size on a rendered Text object is hard, 
@@ -517,4 +578,3 @@ class HotSwapInjector:
         except Exception as e:
             logger.error(f"Color apply error: {e}")
         return False
-

@@ -52,11 +52,67 @@ class ASTAnimationRef:
     line_number: int
     col_offset: int
     kwargs: dict[str, Any] = field(default_factory=dict)
+    call_chain: list[Any] = field(default_factory=list)
+    position_mode: str = "none"
+    position_param_ref: Any = None
+    stable_key: Optional[str] = None
 
     @property
     def animation_key(self) -> str:
         """Stable-ish key used by UI to rebind selected animation after reload."""
+        if self.stable_key:
+            return self.stable_key
         return f"{self.target_var}:{self.method_name}:{self.line_number}:{self.col_offset}"
+
+    @property
+    def is_draggable(self) -> bool:
+        return self.position_mode in {"move_to", "shift", "effect_shift"} and self.position_param_ref is not None
+
+
+@dataclass
+class ASTValueRef:
+    literal_value: Any = None
+    raw_code: str = ""
+    value_kind: str = "unknown"
+    container_kind: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CodeExpression:
+    """Exact Python expression payload used by code-backed property widgets."""
+
+    raw_code: str
+
+
+@dataclass
+class ASTParamRef:
+    target_var: str
+    owner_kind: str
+    owner_name: str
+    line_number: int
+    col_offset: int
+    param_name: str
+    param_index: Optional[int]
+    value_ref: ASTValueRef
+
+    @property
+    def scoped_owner_name(self) -> str:
+        """Compatibility label used by older property-panel code paths."""
+        return self.owner_name
+
+
+@dataclass
+class ASTCallRef:
+    target_var: str
+    owner_kind: str
+    owner_name: str
+    line_number: int
+    col_offset: int
+    params: list[ASTParamRef] = field(default_factory=list)
+
+    @property
+    def scoped_owner_name(self) -> str:
+        return self.owner_name
 
 
 @dataclass
@@ -70,6 +126,7 @@ class ASTNodeRef:
     line_number: int
     col_offset: int
     constructor_name: str  # e.g., "Circle", "Square"
+    bisync_uuid: str = ""  # Persistent UUID injected during AST parsing
     properties: dict[str, Any] = field(default_factory=dict)
     transforms: dict[str, Any] = field(default_factory=dict) # To track .scale(), .rotate()
     source_key: Optional[str] = None
@@ -77,9 +134,16 @@ class ASTNodeRef:
     read_only_reason: str = ""
     display_name: str = ""
     inline_path: tuple[int, ...] = field(default_factory=tuple)
-    constructor_params: list[Any] = field(default_factory=list)
-    modifier_calls: list[Any] = field(default_factory=list)
-    animation_calls: list[Any] = field(default_factory=list)
+    constructor_params: list[ASTParamRef] = field(default_factory=list)
+    modifier_calls: list[ASTCallRef] = field(default_factory=list)
+    animation_calls: list[ASTCallRef] = field(default_factory=list)
+    node_kind: str = "named_direct"
+    primary_owner_kind: str = "constructor"
+    parent_source_key: Optional[str] = None
+    occurrence_index: int = 1
+
+
+SceneNodeRef = ASTNodeRef
 
 
 class PropertyFinder(ast.NodeVisitor):
@@ -92,9 +156,22 @@ class PropertyFinder(ast.NodeVisitor):
     Builds a registry of {line_number: ASTNodeRef} for each found assignment.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, source: str = "", file_path: str | Path | None = None) -> None:
+        self._source = source
+        self._file_path = str(Path(file_path).resolve()) if file_path else None
         self.bindings: dict[int, ASTNodeRef] = {}
+        self.scene_nodes: list[ASTNodeRef] = []
+        self.bindings_by_name: dict[str, ASTNodeRef] = {}
+        self.bindings_by_source_key: dict[str, ASTNodeRef] = {}
+        self.child_bindings: dict[tuple[str, tuple[int, ...]], ASTNodeRef] = {}
+        self.runtime_markers: dict[tuple[str, int, int], ASTNodeRef] = {}
         self.animations: list[ASTAnimationRef] = []
+        self._custom_mobject_classes: set[str] = set()
+        self._helper_returns: dict[str, str] = {}
+        self._occurrence_by_line: dict[int, int] = {}
+        self._imported_symbol_names: set[str] = set()
+        self._manim_imported_names: set[str] = set()
+        self._manim_star_imported: bool = False
         # Known Manim constructors we can modify
         self._known_constructors = {
             "Circle", "Square", "Triangle", "Dot", "Line", "DashedLine",
@@ -109,77 +186,83 @@ class PropertyFinder(ast.NodeVisitor):
             "ValueTracker", "ComplexValueTracker",
             "Surface", "Sphere", "Cone", "Cylinder", "Cube", "Prism"
         }
+        self._modifier_methods = {
+            "move_to", "shift", "rotate", "scale", "stretch", "stretch_to_fit_height",
+            "stretch_to_fit_width", "next_to", "to_edge", "to_corner", "align_to",
+            "center", "flip", "arrange", "arrange_in_grid", "set", "set_x", "set_y",
+            "set_z", "set_color", "set_fill", "set_stroke", "set_opacity",
+            "set_fill_opacity", "set_stroke_opacity", "set_stroke_width",
+            "set_width", "set_height", "set_depth", "set_gloss", "set_shadow",
+            "set_sheen", "set_sheen_direction", "set_z_index", "match_width",
+            "match_height", "match_color", "match_x", "match_y", "match_z",
+            "match_style", "fade", "fade_to", "scale_to_fit_height",
+            "scale_to_fit_width", "rescale_to_fit", "round_corners", "surround",
+        }
+        self._factory_product_overrides = {
+            "plot": "ParametricFunction",
+            "get_graph": "ParametricFunction",
+            "get_area": "Polygon",
+            "get_riemann_rectangles": "VGroup",
+        }
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.name == "manim":
+                self._imported_symbol_names.add(alias.asname or alias.name)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        module = node.module or ""
+        is_manim_import = module == "manim" or module.startswith("manim.")
+        for alias in node.names:
+            imported_name = alias.asname or alias.name
+            self._imported_symbol_names.add(imported_name)
+            if is_manim_import:
+                if alias.name == "*":
+                    self._manim_star_imported = True
+                else:
+                    self._manim_imported_names.add(imported_name)
+        self.generic_visit(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        for base in node.bases:
+            base_name = self._get_func_name(base)
+            if base_name in {"Mobject", "VMobject", "OpenGLMobject", "OpenGLVMobject"}:
+                self._custom_mobject_classes.add(node.name)
+                self._known_constructors.add(node.name)
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        for child in ast.walk(node):
+            if isinstance(child, ast.Return) and child.value is not None:
+                helper_ref = self._node_from_expression(
+                    target_name=f"__helper__{node.name}",
+                    expr=child.value,
+                    assign_node=child,
+                    parent_source_key=None,
+                    inline_path=(),
+                )
+                if helper_ref is not None:
+                    self._helper_returns[node.name] = helper_ref.constructor_name
+                    break
+        self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
-        """Visit assignment nodes to find Manim constructor calls."""
-        # Only handle simple assignments: `name = Constructor(...)`
-        if (
-            len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and isinstance(node.value, ast.Call)
-        ):
+        """Visit assignment nodes and build source-backed scene nodes."""
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             target_name = node.targets[0].id
-            call_node = node.value
+            ref = self._node_from_expression(
+                target_name=target_name,
+                expr=node.value,
+                assign_node=node,
+                parent_source_key=None,
+                inline_path=(),
+            )
+            if ref is not None:
+                self._register_node(ref, top_level=True)
+                self._register_inline_children(ref, node.value)
 
-            # Check if calling a known Manim constructor
-            func_name = self._get_func_name(call_node.func)
-            if func_name in self._known_constructors:
-                # Extract keyword arguments as properties
-                props = {}
-                # Special case: Text/Tex often have the string as the first positional arg
-                if func_name in ("Text", "Tex", "MathTex") and call_node.args:
-                    props["text"] = self._extract_value(call_node.args[0])
-                    
-                for kw in call_node.keywords:
-                    if kw.arg is not None:
-                        props[kw.arg] = self._extract_value(kw.value)
-
-                ref = ASTNodeRef(
-                    variable_name=target_name,
-                    line_number=node.lineno,
-                    col_offset=node.col_offset,
-                    constructor_name=func_name,
-                    properties=props,
-                    source_key=f"{target_name}:{node.lineno}:{node.col_offset}",
-                    display_name=target_name,
-                )
-                self.bindings[node.lineno] = ref
-            else:
-                factory_methods = {
-                    "plot": "ParametricFunction",
-                    "get_graph": "ParametricFunction",
-                    "get_area": "Polygon",
-                    "get_riemann_rectangles": "VGroup",
-                    "n2p": "Dot",
-                    "c2p": "Dot",
-                    "coords_to_point": "Dot",
-                    "copy": "Mobject",
-                    "animate": "Mobject"
-                }
-                if func_name in factory_methods and isinstance(call_node.func, ast.Attribute):
-                    props = {}
-                    for kw in call_node.keywords:
-                        if kw.arg is not None:
-                            props[kw.arg] = self._extract_value(kw.value)
-                    
-                    constructor_guess = factory_methods[func_name]
-                    ref = ASTNodeRef(
-                        variable_name=target_name,
-                        line_number=node.lineno,
-                        col_offset=node.col_offset,
-                        constructor_name=constructor_guess,
-                        properties=props,
-                        source_key=f"{target_name}:{node.lineno}:{node.col_offset}",
-                        display_name=target_name,
-                        editability="source_editable",
-                    )
-                    self.bindings[node.lineno] = ref
-
-
-
-
-        # No generic_visit(node) here to prevent redundant traversal since visit_Call
-        # handles Call nodes directly.
+        self.generic_visit(node)
     def visit_Call(self, node: ast.Call) -> None:
         """Visit call nodes to find animations.
 
@@ -223,6 +306,23 @@ class PropertyFinder(ast.NodeVisitor):
             self.animations.append(ref)
             pass
 
+        elif func_name == "add":
+            for index, arg in enumerate(node.args):
+                inline_ref = self._node_from_expression(
+                    target_name=f"inline_{getattr(arg, 'lineno', node.lineno)}_{index}",
+                    expr=arg,
+                    assign_node=arg,
+                    parent_source_key=None,
+                    inline_path=(),
+                )
+                if inline_ref is not None:
+                    inline_ref.node_kind = (
+                        "inline_factory_method"
+                        if inline_ref.primary_owner_kind == "factory_method"
+                        else "inline_direct"
+                    )
+                    self._register_node(inline_ref, top_level=True)
+
         self.generic_visit(node)
 
     def _extract_animation_from_play_arg(self, arg: Any, play_kwargs: dict[str, Any]) -> None:
@@ -230,31 +330,41 @@ class PropertyFinder(ast.NodeVisitor):
         # Pattern 1: obj.animate.method(...) — e.g. circle.animate.shift(UP)
         # Also handles chained methods e.g. circle.animate.set_color(RED).shift(UP)
         if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Attribute):
-            current = arg.func
-            method_name = current.attr
-            target_var = None
-            
-            # Walk down the AST to find .animate
-            while isinstance(current, ast.Attribute):
-                if current.attr == "animate" and isinstance(current.value, ast.Name):
-                    target_var = current.value.id
-                    break
-                if isinstance(current.value, ast.Call) and isinstance(current.value.func, ast.Attribute):
-                    current = current.value.func
-                elif isinstance(current.value, ast.Attribute):
-                    current = current.value
-                else:
-                    break
-                    
+            target_var, chain_calls = self._extract_animate_chain(arg)
             if target_var:
-                extracted_args = [self._extract_value(a) for a in arg.args]
+                position_call = next(
+                    (call for call in chain_calls if self._get_func_name(call.func) in {"move_to", "shift"}),
+                    None,
+                )
+                selected_call = position_call or arg
+                method_name = self._get_func_name(selected_call.func)
+                params = self._build_params(
+                    target_var=target_var,
+                    owner_kind="animation",
+                    owner_name=method_name,
+                    call_node=selected_call,
+                )
+                position_param = params[0] if position_call is not None and params else None
+                position_mode = method_name if method_name in {"move_to", "shift"} else "none"
+                call_chain = [
+                    self._build_call_ref(
+                        target_var=target_var,
+                        owner_kind="animation",
+                        owner_name=self._get_func_name(call.func),
+                        call_node=call,
+                    )
+                    for call in chain_calls
+                ]
                 ref = ASTAnimationRef(
                     target_var=target_var,
                     method_name=method_name,
-                    args=extracted_args,
-                    line_number=arg.lineno,
-                    col_offset=arg.col_offset,
+                    args=[self._extract_value(a) for a in selected_call.args],
+                    line_number=selected_call.lineno,
+                    col_offset=selected_call.col_offset,
                     kwargs=play_kwargs.copy(),
+                    call_chain=call_chain,
+                    position_mode=position_mode,
+                    position_param_ref=position_param,
                 )
                 self.animations.append(ref)
                 pass
@@ -269,20 +379,56 @@ class PropertyFinder(ast.NodeVisitor):
             if func_name in {
                 "Create", "FadeIn", "FadeOut", "Grow", "Shrink",
                 "Rotate", "Scale", "Write", "DrawBorderThenFill",
+                "ReplacementTransform", "Transform", "FadeTransform",
+                "SpinInFromNothing", "GrowFromCenter", "GrowArrow",
             }:
                 # Extract target from first argument
                 target = None
-                if arg.args and isinstance(arg.args[0], ast.Name):
-                    target = arg.args[0].id
-                elif arg.args and isinstance(arg.args[0], ast.Attribute):
-                    # e.g. VGroup(circle, square) — use the variable name if available
-                    target = self._get_func_name(arg.args[0])
+                if arg.args:
+                    arg0 = arg.args[0]
+                    # Simple name: Create(triangle)
+                    if isinstance(arg0, ast.Name):
+                        target = arg0.id
+                    elif isinstance(arg0, ast.Call):
+                        inline_ref = self._node_from_expression(
+                            target_name=f"inline_play_{getattr(arg0, 'lineno', arg.lineno)}_0",
+                            expr=arg0,
+                            assign_node=arg0,
+                            parent_source_key=None,
+                            inline_path=(),
+                        )
+                        if inline_ref is not None:
+                            inline_ref.node_kind = (
+                                "inline_factory_method"
+                                if inline_ref.primary_owner_kind == "factory_method"
+                                else "inline_direct"
+                            )
+                            self._register_node(inline_ref, top_level=True)
+                            target = inline_ref.variable_name
+                    # Attribute: Create(self.triangle)
+                    elif isinstance(arg0, ast.Attribute) and isinstance(arg0.value, ast.Name) and arg0.value.id == "self":
+                        target = arg0.attr
+                    # Nested attribute: Create(group[0])
+                    elif isinstance(arg0, ast.Attribute):
+                        target = getattr(arg0, 'attr', None)
 
                 if target:
                     anim_kwargs = play_kwargs.copy()
+                    effect_params = self._build_params(
+                        target_var=target,
+                        owner_kind="animation",
+                        owner_name=func_name,
+                        call_node=arg,
+                    )
+                    position_param = None
                     for kw in arg.keywords:
                         if kw.arg is not None:
                             anim_kwargs[kw.arg] = self._extract_value(kw.value)
+                            if kw.arg == "shift":
+                                position_param = next(
+                                    (param for param in effect_params if param.param_name == "shift"),
+                                    None,
+                                )
                             
                     ref = ASTAnimationRef(
                         target_var=target,
@@ -291,10 +437,35 @@ class PropertyFinder(ast.NodeVisitor):
                         line_number=arg.lineno,
                         col_offset=arg.col_offset,
                         kwargs=anim_kwargs,
+                        call_chain=[
+                            ASTCallRef(
+                                target_var=target,
+                                owner_kind="animation",
+                                owner_name=func_name,
+                                line_number=arg.lineno,
+                                col_offset=arg.col_offset,
+                                params=effect_params,
+                            )
+                        ],
+                        position_mode="effect_shift" if position_param is not None else "none",
+                        position_param_ref=position_param,
                     )
                     self.animations.append(ref)
                     pass
 
+
+    def _extract_animate_chain(self, call: ast.Call) -> tuple[Optional[str], list[ast.Call]]:
+        chain: list[ast.Call] = []
+        current: ast.AST = call
+        target_var: Optional[str] = None
+        while isinstance(current, ast.Call) and isinstance(current.func, ast.Attribute):
+            chain.insert(0, current)
+            owner = current.func.value
+            if isinstance(owner, ast.Attribute) and owner.attr == "animate" and isinstance(owner.value, ast.Name):
+                target_var = owner.value.id
+                break
+            current = owner
+        return target_var, chain
 
 
     def visit_Expr(self, node: ast.Expr) -> None:
@@ -310,9 +481,19 @@ class PropertyFinder(ast.NodeVisitor):
             
             if isinstance(root_target, ast.Name):
                 target_var = root_target.id
+                for ref in self.scene_nodes:
+                    if ref.variable_name == target_var:
+                        call_ref = self._build_call_ref(
+                            target_var=target_var,
+                            owner_kind="modifier",
+                            owner_name=method_name,
+                            call_node=current,
+                        )
+                        ref.modifier_calls.append(call_ref)
+                        break
                 if method_name in ("scale", "rotate"):
                     # Find the ASTNodeRef by variable name
-                    for ref in self.bindings.values():
+                    for ref in self.scene_nodes:
                         if ref.variable_name == target_var:
                             if current.args:
                                 val = self._extract_value(current.args[0])
@@ -331,6 +512,346 @@ class PropertyFinder(ast.NodeVisitor):
         if isinstance(node, ast.Attribute):
             return node.attr
         return ""
+
+    def _register_node(self, ref: ASTNodeRef, *, top_level: bool) -> None:
+        self.scene_nodes.append(ref)
+        self.bindings_by_source_key[ref.source_key or ""] = ref
+        if ref.source_key:
+            self.child_bindings[(ref.source_key, tuple(ref.inline_path))] = ref
+        if ref.parent_source_key:
+            self.child_bindings[(ref.parent_source_key, tuple(ref.inline_path))] = ref
+        if ref.variable_name:
+            self.bindings_by_name[ref.variable_name] = ref
+        if top_level:
+            self.bindings.setdefault(ref.line_number, ref)
+        if self._file_path:
+            self.runtime_markers[(self._file_path, ref.line_number, ref.occurrence_index)] = ref
+
+    def _next_occurrence(self, line_number: int) -> int:
+        self._occurrence_by_line[line_number] = self._occurrence_by_line.get(line_number, 0) + 1
+        return self._occurrence_by_line[line_number]
+
+    def _source_key(self, target_name: str, line: int, col: int, kind: str, occurrence: int, path: tuple[int, ...] = ()) -> str:
+        path_part = ".".join(str(i) for i in path) if path else "root"
+        return f"{target_name}:{line}:{col}:{kind}:{occurrence}:{path_part}"
+
+    def _node_from_expression(
+        self,
+        *,
+        target_name: str,
+        expr: ast.AST,
+        assign_node: ast.AST,
+        parent_source_key: Optional[str],
+        inline_path: tuple[int, ...],
+    ) -> Optional[ASTNodeRef]:
+        if not isinstance(expr, ast.Call):
+            return None
+
+        classification = self._classify_scene_expression(expr)
+        if classification is None:
+            return None
+        primary_call = classification["primary_call"]
+        primary_owner_kind = classification["primary_owner_kind"]
+        constructor_name = classification["constructor_name"]
+        node_kind = classification["node_kind"]
+        editability = classification["editability"]
+        read_only_reason = classification["read_only_reason"]
+        primary_name = classification["primary_name"]
+        modifier_chain = classification["modifier_chain"]
+
+        if inline_path:
+            node_kind = (
+                "inline_factory_method"
+                if primary_owner_kind == "factory_method"
+                else "inline_direct"
+            )
+
+        occurrence = self._next_occurrence(getattr(primary_call, "lineno", getattr(assign_node, "lineno", 0)))
+        source_key = self._source_key(
+            target_name,
+            getattr(primary_call, "lineno", getattr(assign_node, "lineno", 0)),
+            getattr(primary_call, "col_offset", getattr(assign_node, "col_offset", 0)),
+            node_kind,
+            occurrence,
+            inline_path,
+        )
+        params = self._build_params(
+            target_var=target_name,
+            owner_kind=primary_owner_kind,
+            owner_name=primary_name,
+            call_node=primary_call,
+        )
+        props = {param.param_name: param.value_ref.literal_value for param in params if param.param_name}
+
+        ref = ASTNodeRef(
+            variable_name=target_name,
+            line_number=getattr(primary_call, "lineno", getattr(assign_node, "lineno", 0)),
+            col_offset=getattr(primary_call, "col_offset", getattr(assign_node, "col_offset", 0)),
+            constructor_name=constructor_name,
+            bisync_uuid=target_name,
+            properties=props,
+            source_key=source_key,
+            editability=editability,
+            read_only_reason=read_only_reason,
+            display_name=target_name,
+            inline_path=inline_path,
+            constructor_params=params,
+            node_kind=node_kind,
+            primary_owner_kind=primary_owner_kind,
+            parent_source_key=parent_source_key,
+            occurrence_index=occurrence,
+        )
+        for call in modifier_chain:
+            ref.modifier_calls.append(
+                self._build_call_ref(
+                    target_var=target_name,
+                    owner_kind="modifier",
+                    owner_name=self._get_func_name(call.func),
+                    call_node=call,
+                )
+            )
+        return ref
+
+    def _classify_scene_expression(self, expr: ast.Call) -> Optional[dict[str, Any]]:
+        root_call, modifier_chain = self._split_call_chain(expr)
+        if root_call is None:
+            return None
+
+        factory_match = self._find_factory_call(root_call, modifier_chain)
+        if factory_match is not None:
+            factory_call, post_factory_chain = factory_match
+            method_name = self._get_func_name(factory_call.func)
+            return {
+                "primary_call": factory_call,
+                "primary_owner_kind": "factory_method",
+                "constructor_name": self._factory_product_name(method_name),
+                "node_kind": "named_factory_method",
+                "editability": "source_editable",
+                "read_only_reason": "",
+                "primary_name": method_name,
+                "modifier_chain": post_factory_chain,
+            }
+
+        if isinstance(root_call.func, ast.Name):
+            func_name = self._get_func_name(root_call.func)
+            if func_name in self._helper_returns:
+                return {
+                    "primary_call": root_call,
+                    "primary_owner_kind": "helper_return",
+                    "constructor_name": self._helper_returns[func_name],
+                    "node_kind": "helper_return",
+                    "editability": "source_read_only",
+                    "read_only_reason": "helper-return objects are source read-only in v1",
+                    "primary_name": func_name,
+                    "modifier_chain": modifier_chain,
+                }
+            if self._is_probable_scene_constructor_name(func_name):
+                return {
+                    "primary_call": root_call,
+                    "primary_owner_kind": "constructor",
+                    "constructor_name": func_name,
+                    "node_kind": "named_chained" if modifier_chain else "named_direct",
+                    "editability": "source_editable",
+                    "read_only_reason": "",
+                    "primary_name": func_name,
+                    "modifier_chain": modifier_chain,
+                }
+        elif (
+            isinstance(root_call.func, ast.Attribute)
+            and isinstance(root_call.func.value, ast.Name)
+            and root_call.func.value.id == "self"
+        ):
+            helper_name = root_call.func.attr
+            if helper_name in self._helper_returns:
+                return {
+                    "primary_call": root_call,
+                    "primary_owner_kind": "helper_return",
+                    "constructor_name": self._helper_returns[helper_name],
+                    "node_kind": "helper_return",
+                    "editability": "source_read_only",
+                    "read_only_reason": "helper-return objects are source read-only in v1",
+                    "primary_name": helper_name,
+                    "modifier_chain": modifier_chain,
+                }
+        return None
+
+    def _find_factory_call(
+        self,
+        root_call: ast.Call,
+        modifier_chain: list[ast.Call],
+    ) -> Optional[tuple[ast.Call, list[ast.Call]]]:
+        chain_calls: list[ast.Call] = []
+        if isinstance(root_call.func, ast.Attribute):
+            chain_calls.append(root_call)
+        chain_calls.extend(modifier_chain)
+
+        for index, call in enumerate(chain_calls):
+            if not isinstance(call.func, ast.Attribute):
+                continue
+            method_name = call.func.attr
+            if method_name in self._modifier_methods:
+                continue
+            if not self._expression_returns_scene_object(call.func.value):
+                continue
+            return call, chain_calls[index + 1:]
+        return None
+
+    def _expression_returns_scene_object(self, expr: ast.AST) -> bool:
+        if isinstance(expr, ast.Name):
+            return expr.id in self.bindings_by_name or expr.id in self._helper_returns
+        if isinstance(expr, ast.Subscript):
+            return self._expression_returns_scene_object(expr.value)
+        if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name):
+            if expr.value.id == "self":
+                return True
+        if isinstance(expr, ast.Call):
+            return self._classify_scene_expression(expr) is not None
+        return False
+
+    def _is_probable_scene_constructor_name(self, func_name: str) -> bool:
+        if not func_name:
+            return False
+        if func_name in self._known_constructors:
+            return True
+        if func_name in self._custom_mobject_classes:
+            return True
+        if func_name in self._manim_imported_names:
+            return True
+        if func_name in self._imported_symbol_names and func_name[:1].isupper():
+            return True
+        if self._manim_star_imported and func_name[:1].isupper():
+            return True
+        return False
+
+    def _factory_product_name(self, method_name: str) -> str:
+        if method_name in self._factory_product_overrides:
+            return self._factory_product_overrides[method_name]
+        return method_name
+
+    def _register_inline_children(self, parent_ref: ASTNodeRef, expr: ast.AST) -> None:
+        root_call, _chain = self._split_call_chain(expr)
+        if root_call is None:
+            return
+        for index, arg in enumerate(root_call.args):
+            child = self._node_from_expression(
+                target_name=f"{parent_ref.variable_name}[{index}]",
+                expr=arg,
+                assign_node=arg,
+                parent_source_key=parent_ref.source_key,
+                inline_path=(index,),
+            )
+            if child is not None:
+                self._register_node(child, top_level=False)
+
+    def _split_call_chain(self, expr: ast.AST) -> tuple[Optional[ast.Call], list[ast.Call]]:
+        if not isinstance(expr, ast.Call):
+            return None, []
+        chain: list[ast.Call] = []
+        current = expr
+        while isinstance(current, ast.Call) and isinstance(current.func, ast.Attribute):
+            owner = current.func.value
+            if isinstance(owner, ast.Call):
+                chain.insert(0, current)
+                current = owner
+                continue
+            break
+        if isinstance(current, ast.Call):
+            return current, chain
+        return None, chain
+
+    def _build_call_ref(self, target_var: str, owner_kind: str, owner_name: str, call_node: ast.Call) -> ASTCallRef:
+        return ASTCallRef(
+            target_var=target_var,
+            owner_kind=owner_kind,
+            owner_name=owner_name,
+            line_number=getattr(call_node, "lineno", 0),
+            col_offset=getattr(call_node, "col_offset", 0),
+            params=self._build_params(
+                target_var=target_var,
+                owner_kind=owner_kind,
+                owner_name=owner_name,
+                call_node=call_node,
+            ),
+        )
+
+    def _build_params(self, target_var: str, owner_kind: str, owner_name: str, call_node: ast.Call) -> list[ASTParamRef]:
+        params: list[ASTParamRef] = []
+        positional_names = self._positional_names(owner_name, call_node, owner_kind)
+        for index, arg in enumerate(call_node.args):
+            name = positional_names[index] if index < len(positional_names) else f"arg{index}"
+            params.append(ASTParamRef(
+                target_var=target_var,
+                owner_kind=owner_kind,
+                owner_name=owner_name,
+                line_number=getattr(arg, "lineno", getattr(call_node, "lineno", 0)),
+                col_offset=getattr(arg, "col_offset", getattr(call_node, "col_offset", 0)),
+                param_name=name,
+                param_index=index,
+                value_ref=self._build_value_ref(arg),
+            ))
+        for kw in call_node.keywords:
+            if kw.arg is None:
+                continue
+            params.append(ASTParamRef(
+                target_var=target_var,
+                owner_kind=owner_kind,
+                owner_name=owner_name,
+                line_number=getattr(kw.value, "lineno", getattr(call_node, "lineno", 0)),
+                col_offset=getattr(kw.value, "col_offset", getattr(call_node, "col_offset", 0)),
+                param_name=kw.arg,
+                param_index=None,
+                value_ref=self._build_value_ref(kw.value),
+            ))
+        return params
+
+    def _positional_names(self, owner_name: str, call_node: ast.Call, owner_kind: str) -> list[str]:
+        if owner_name in {"Text", "Tex", "MathTex"}:
+            return ["text"]
+        if owner_name == "Dot":
+            return ["point"]
+        if owner_name in {"Line", "Arrow", "DoubleArrow", "DashedLine"}:
+            return ["start", "end"]
+        if owner_name == "next_to":
+            return ["mobject_or_point", "direction"]
+        if owner_name == "to_edge":
+            return ["edge"]
+        if owner_name in {"move_to", "shift"}:
+            return ["point" if owner_name == "move_to" else "vector"]
+        if owner_name == "plot" and owner_kind == "factory_method":
+            return ["function"]
+        return [f"arg{i}" for i, _ in enumerate(call_node.args)]
+
+    def _build_value_ref(self, node: ast.expr) -> ASTValueRef:
+        literal = self._extract_value(node)
+        raw_code = ast.get_source_segment(self._source, node) if self._source else None
+        if raw_code is None:
+            try:
+                raw_code = ast.unparse(node)
+            except Exception:
+                raw_code = ""
+        container_kind = None
+        if isinstance(node, ast.List):
+            container_kind = "list"
+        elif isinstance(node, ast.Tuple):
+            container_kind = "tuple"
+        if isinstance(literal, bool):
+            value_kind = "bool"
+        elif isinstance(literal, (int, float)):
+            value_kind = "number"
+        elif isinstance(literal, str):
+            value_kind = "string"
+        elif isinstance(literal, list):
+            value_kind = "container"
+        elif literal is None:
+            value_kind = "expression"
+        else:
+            value_kind = type(literal).__name__
+        return ASTValueRef(
+            literal_value=literal,
+            raw_code=raw_code,
+            value_kind=value_kind,
+            container_kind=container_kind,
+        )
 
     def _extract_value(self, node: ast.expr) -> Any:
         """Extract Python value from AST node."""
@@ -372,6 +893,50 @@ class PropertyUpdater(ast.NodeTransformer):
         self._modified = False
         self._was_skipped = False
 
+    def _build_expr(self) -> Optional[ast.expr]:
+        value = self._new_value
+        if isinstance(value, CodeExpression):
+            try:
+                return ast.parse(value.raw_code, mode="eval").body
+            except SyntaxError as exc:
+                logger.warning(
+                    "Invalid code expression for %s.%s: %s",
+                    self._target_var,
+                    self._prop_name,
+                    exc,
+                )
+                self._was_skipped = True
+                return None
+        if isinstance(value, bool) or value is None or isinstance(value, (int, float, str)):
+            return ast.Constant(value=value)
+        if isinstance(value, list):
+            return ast.List(
+                elts=[PropertyUpdater._expr_from_literal(item) for item in value],
+                ctx=ast.Load(),
+            )
+        if isinstance(value, tuple):
+            return ast.Tuple(
+                elts=[PropertyUpdater._expr_from_literal(item) for item in value],
+                ctx=ast.Load(),
+            )
+        return ast.Constant(value=str(value))
+
+    @staticmethod
+    def _expr_from_literal(value: Any) -> ast.expr:
+        if isinstance(value, bool) or value is None or isinstance(value, (int, float, str)):
+            return ast.Constant(value=value)
+        if isinstance(value, list):
+            return ast.List(
+                elts=[PropertyUpdater._expr_from_literal(item) for item in value],
+                ctx=ast.Load(),
+            )
+        if isinstance(value, tuple):
+            return ast.Tuple(
+                elts=[PropertyUpdater._expr_from_literal(item) for item in value],
+                ctx=ast.Load(),
+            )
+        return ast.Constant(value=str(value))
+
     @property
     def was_modified(self) -> bool:
         return self._modified
@@ -381,56 +946,68 @@ class PropertyUpdater(ast.NodeTransformer):
         return self._was_skipped
 
     def visit_Assign(self, node: ast.Assign) -> ast.Assign:
-        """Find the target assignment and modify its property.
+        """Find the target assignment and modify its property."""
+        replacement_expr = self._build_expr()
+        if replacement_expr is None and self._was_skipped:
+            return node
 
-        When user explicitly changes a property (via slider), the old value
-        is replaced unconditionally. Complex expressions (e.g., `radius=UP*2`)
-        are simplified to the computed value — this is intentional, as the user
-        has explicitly chosen to override via the GUI.
-        """
-        if (
-            len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id == self._target_var
-            and isinstance(node.value, ast.Call)
-        ):
+        is_target = False
+        if len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name) and target.id == self._target_var:
+                is_target = True
+            elif isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self" and target.attr == self._target_var:
+                is_target = True
+
+        if is_target and isinstance(node.value, ast.Call):
             # Special case for "text" property in Text/Tex (first positional arg)
             if self._prop_name == "text" and node.value.args:
-                if isinstance(node.value.args[0], ast.Constant):
-                    node.value.args[0] = ast.Constant(value=self._new_value)
-                    self._modified = True
-                    logger.info(
-                        f"AST Surgery: {self._target_var}.text "
-                        f"→ {self._new_value} (line {node.lineno})"
-                    )
+                node.value.args[0] = replacement_expr
+                self._modified = True
+                logger.info(
+                    f"AST Surgery: {self._target_var}.text "
+                    f"→ {self._new_value} (line {node.lineno})"
+                )
                 return node
                 
             # Found the target assignment — modify the keyword
             for kw in node.value.keywords:
                 if kw.arg == self._prop_name:
-                    # Only replace if existing value is a simple constant
                     if isinstance(kw.value, ast.Constant):
                         # Safe to replace — it's a simple literal
-                        kw.value = ast.Constant(value=self._new_value)
+                        kw.value = replacement_expr
                         self._modified = True
                         logger.info(
                             f"AST Surgery: {self._target_var}.{self._prop_name} "
                             f"→ {self._new_value} (line {node.lineno})"
                         )
+                    elif isinstance(kw.value, ast.IfExp) and getattr(kw.value.test, "value", False) is True:
+                        # Already wrapped, update the body
+                        kw.value.body = replacement_expr
+                        self._modified = True
+                        logger.info(
+                            f"AST Surgery: Updated wrapped {self._target_var}.{self._prop_name} "
+                            f"→ {self._new_value} (line {node.lineno})"
+                        )
                     else:
-                        # Complex expression — skip, don't lose the expression
-                        self._was_skipped = True
-                        logger.warning(
-                            f"Skipping {self._target_var}.{self._prop_name}: "
-                            f"existing value is a complex expression, not a simple constant. "
-                            f"Manual code edit required."
+                        # Complex expression — wrap it instead of losing it!
+                        # e.g., `radius=3.5 if True else (UP*2)`
+                        kw.value = ast.IfExp(
+                            test=ast.Constant(value=True),
+                            body=replacement_expr,
+                            orelse=kw.value
+                        )
+                        self._modified = True
+                        logger.info(
+                            f"AST Surgery: Wrapped {self._target_var}.{self._prop_name} "
+                            f"→ {self._new_value} (line {node.lineno})"
                         )
                     break
             else:
                 # Property doesn't exist yet — add it as new keyword
                 new_kw = ast.keyword(
                     arg=self._prop_name,
-                    value=ast.Constant(value=self._new_value),
+                    value=replacement_expr,
                 )
                 node.value.keywords.append(new_kw)
                 self._modified = True
@@ -461,6 +1038,10 @@ class ASTMutator:
         self._bindings: dict[int, ASTNodeRef] = {}
         # Secondary index: variable_name → ASTNodeRef (O(1) lookup)
         self._bindings_by_name: dict[str, ASTNodeRef] = {}
+        self._scene_nodes: list[ASTNodeRef] = []
+        self._bindings_by_source_key: dict[str, ASTNodeRef] = {}
+        self._child_bindings: dict[tuple[str, tuple[int, ...]], ASTNodeRef] = {}
+        self._runtime_markers: dict[tuple[str, int, int], ASTNodeRef] = {}
         self._animations: list[ASTAnimationRef] = []
 
         # Socket 4: Live binds — mobject_id → ASTNodeRef
@@ -488,7 +1069,7 @@ class ASTMutator:
         """Return current source-of-truth text for commit checks."""
         if self._tree is not None:
             try:
-                return ast.unparse(self._tree) + "\n"
+                return self._generate_format_preserving_source()
             except Exception:
                 pass
         return (self._source or "")
@@ -499,7 +1080,7 @@ class ASTMutator:
         if self._tree is None:
             return False
         try:
-            return (self._source or "").rstrip() != ast.unparse(self._tree).rstrip()
+            return (self._source or "").rstrip() != self._generate_format_preserving_source().rstrip()
         except Exception:
             return False
 
@@ -519,11 +1100,15 @@ class ASTMutator:
         self._tree = ast.parse(self._source, filename=str(path))
 
         # Find all Manim variable bindings
-        finder = PropertyFinder()
+        finder = PropertyFinder(self._source, path)
         finder.visit(self._tree)
         self._bindings = finder.bindings
         # Build O(1) name index
-        self._bindings_by_name = {ref.variable_name: ref for ref in self._bindings.values()}
+        self._bindings_by_name = finder.bindings_by_name
+        self._scene_nodes = finder.scene_nodes
+        self._bindings_by_source_key = finder.bindings_by_source_key
+        self._child_bindings = finder.child_bindings
+        self._runtime_markers = finder.runtime_markers
         self._animations = finder.animations
 
         logger.info(
@@ -539,24 +1124,25 @@ class ASTMutator:
         self._file_path = path
         self._source = source_text
         self._tree = ast.parse(source_text, filename=str(path))
-        finder = PropertyFinder()
+        finder = PropertyFinder(source_text, path)
         finder.visit(self._tree)
         self._bindings = finder.bindings
-        self._bindings_by_name = {ref.variable_name: ref for ref in self._bindings.values()}
+        self._bindings_by_name = finder.bindings_by_name
+        self._scene_nodes = finder.scene_nodes
+        self._bindings_by_source_key = finder.bindings_by_source_key
+        self._child_bindings = finder.child_bindings
+        self._runtime_markers = finder.runtime_markers
         self._animations = finder.animations
         return self._bindings
 
     def iter_scene_nodes(self):
         """Compatibility iterator expected by MainWindow snapshot flow."""
-        return self._bindings.values()
+        return self._scene_nodes
 
     def get_binding_by_source_key(self, source_key: Optional[str]):
         if not source_key:
             return None
-        for ref in self._bindings.values():
-            if ref.source_key == source_key:
-                return ref
-        return None
+        return self._bindings_by_source_key.get(source_key)
 
     def get_binding_by_line(self, line_number: int) -> Optional[ASTNodeRef]:
         return self._bindings.get(line_number)
@@ -567,14 +1153,24 @@ class ASTMutator:
         line_number: Optional[int],
         occurrence: Optional[int],
     ) -> Optional[ASTNodeRef]:
-        del source_file, occurrence
         if line_number is None:
+            return None
+        if source_file:
+            if not self.owns_source_file(source_file):
+                return None
+            try:
+                resolved = str(Path(source_file).resolve())
+            except Exception:
+                resolved = source_file
+            if occurrence is not None:
+                return self._runtime_markers.get((resolved, line_number, occurrence))
             return None
         return self._bindings.get(line_number)
 
     def get_child_binding(self, source_key: Optional[str], path: tuple[int, ...]):
-        del path
-        return self.get_binding_by_source_key(source_key)
+        if not source_key:
+            return None
+        return self._child_bindings.get((source_key, tuple(path)))
 
     def owns_source_file(self, source_file: Optional[str]) -> bool:
         if self._file_path is None or not source_file:
@@ -593,7 +1189,28 @@ class ASTMutator:
         for anim in self._animations:
             if anim.animation_key == animation_key:
                 return anim
+        parts = animation_key.split(":")
+        if len(parts) >= 2:
+            target, method = parts[0], parts[1]
+            for anim in self._animations:
+                if anim.target_var == target and anim.method_name == method:
+                    anim.stable_key = animation_key
+                    return anim
         return None
+
+    def _rebuild_metadata_from_tree(self) -> None:
+        if self._tree is None:
+            return
+        source_for_segments = self._source or ast.unparse(self._tree)
+        finder = PropertyFinder(source_for_segments, self._file_path)
+        finder.visit(self._tree)
+        self._bindings = finder.bindings
+        self._bindings_by_name = finder.bindings_by_name
+        self._scene_nodes = finder.scene_nodes
+        self._bindings_by_source_key = finder.bindings_by_source_key
+        self._child_bindings = finder.child_bindings
+        self._runtime_markers = finder.runtime_markers
+        self._animations = finder.animations
 
     def plan_property_persistence(
         self,
@@ -604,19 +1221,30 @@ class ASTMutator:
         path: tuple[int, ...] = (),
     ) -> PersistenceStrategy:
         """Choose persistence mode for an edit (exact/patch/no-persist)."""
-        del prop_name
         if source_key:
             ref = self.get_binding_by_source_key(source_key)
             if ref is not None:
+                if ref.editability != "source_editable":
+                    return PersistenceStrategy(
+                        mode="no_persist",
+                        reason=ref.read_only_reason or "source read-only target",
+                        source_key=source_key,
+                    )
                 if path and tuple(path) != tuple(getattr(ref, "inline_path", ())):
                     return PersistenceStrategy(
                         mode="no_persist",
-                        reason="selected runtime child is not the canonical source anchor",
+                        reason="selected runtime child is not an exact source anchor",
+                        source_key=source_key,
+                    )
+                if prop_name in ref.properties or prop_name in {"text"}:
+                    return PersistenceStrategy(
+                        mode="exact_source",
+                        reason="source key resolves to canonical AST binding",
                         source_key=source_key,
                     )
                 return PersistenceStrategy(
-                    mode="exact_source",
-                    reason="source key resolves to canonical AST binding",
+                    mode="safe_patch",
+                    reason="property is not a constructor param; use post-creation patch",
                     source_key=source_key,
                 )
 
@@ -641,6 +1269,28 @@ class ASTMutator:
             source_key=source_key,
         )
 
+    def plan_position_persistence(
+        self,
+        target_var: str,
+        *,
+        source_key: Optional[str] = None,
+        path: tuple[int, ...] = (),
+    ) -> PersistenceStrategy:
+        """Choose persistence mode for drag-position edits."""
+        if source_key:
+            ref = self.get_binding_by_source_key(source_key)
+            if ref is None:
+                return PersistenceStrategy("no_persist", "source anchor could not be resolved", source_key)
+            if ref.editability != "source_editable":
+                return PersistenceStrategy("no_persist", ref.read_only_reason or "source read-only target", source_key)
+            if tuple(path) != tuple(getattr(ref, "inline_path", ())):
+                return PersistenceStrategy("no_persist", "selected runtime child is not an exact source anchor", source_key)
+            return PersistenceStrategy("safe_patch", "position persists as post-creation move_to patch", source_key)
+        ref = self.get_binding_by_name(target_var)
+        if ref is not None and ref.editability == "source_editable":
+            return PersistenceStrategy("safe_patch", "variable name resolves to source-backed object", ref.source_key)
+        return PersistenceStrategy("no_persist", "runtime-only object has no reliable source anchor", source_key)
+
     def persist_property_edit(
         self,
         target_var: str,
@@ -659,7 +1309,7 @@ class ASTMutator:
                 return True
 
         if strategy.exact_source:
-            return self.update_property(target_var, prop_name, new_value)
+            return self.update_property(target_var, prop_name, new_value, source_key=strategy.source_key)
 
         # safe_patch fallback
         return self._inject_post_creation_assignment(target_var, prop_name, new_value)
@@ -679,6 +1329,13 @@ class ASTMutator:
         if current_value == new_value:
             return True
 
+        if self._file_path:
+            try:
+                self.parse_file(self._file_path)
+            except Exception as e:
+                logger.error(f"Failed to re-parse before injection: {e}")
+                return False
+
         ref = self.get_binding_by_name(target_var)
         if ref is None:
             logger.warning("Safe patch failed: no binding for %s", target_var)
@@ -696,11 +1353,18 @@ class ASTMutator:
                 return ast.Name(id=self.target, ctx=ast.Load())
 
             def _literal(self) -> ast.expr:
+                if isinstance(self.value, CodeExpression):
+                    return ast.parse(self.value.raw_code, mode="eval").body
                 if isinstance(self.value, (int, float, str, bool)) or self.value is None:
                     return ast.Constant(value=self.value)
-                if isinstance(self.value, (list, tuple)):
+                if isinstance(self.value, list):
                     return ast.List(
-                        elts=[ast.Constant(value=v) for v in self.value],
+                        elts=[PropertyUpdater._expr_from_literal(v) for v in self.value],
+                        ctx=ast.Load(),
+                    )
+                if isinstance(self.value, tuple):
+                    return ast.Tuple(
+                        elts=[PropertyUpdater._expr_from_literal(v) for v in self.value],
                         ctx=ast.Load(),
                     )
                 return ast.Constant(value=str(self.value))
@@ -746,6 +1410,9 @@ class ASTMutator:
                 if p in {"move_to", "position", "center"} and isinstance(self.value, (list, tuple)):
                     return self._call_stmt("move_to", lit)
 
+                if p == "gloss":
+                    return self._call_stmt("set_gloss", lit)
+
                 # Fallback: direct assignment
                 return ast.Assign(
                     targets=[
@@ -760,16 +1427,69 @@ class ASTMutator:
 
             def _inject_into_stmt_list(self, stmts: list[ast.stmt]) -> list[ast.stmt]:
                 output: list[ast.stmt] = []
+                p = self.prop.lower()
+                
+                # Semantic mapping of property to Manim setter methods
+                setter_map = {
+                    "color": "set_color",
+                    "fill_opacity": "set_fill",
+                    "stroke_width": "set_stroke",
+                    "stroke_opacity": "set_stroke",
+                }
+                target_setter = setter_map.get(p)
+                
                 for stmt in stmts:
+                    # Check if this is an existing call to a setter for this property
+                    is_existing_setter = False
+                    if (not self.injected and target_setter and 
+                        isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call) and
+                        isinstance(stmt.value.func, ast.Attribute) and 
+                        isinstance(stmt.value.func.value, ast.Name) and 
+                        stmt.value.func.value.id == self.target and
+                        stmt.value.func.attr == target_setter):
+                        
+                        # We found a potential setter. Check if it's the RIGHT one for stroke_width vs stroke_opacity
+                        if target_setter == "set_stroke":
+                            # Check keywords
+                            is_match = False
+                            if p == "stroke_width":
+                                if any(kw.arg == "width" for kw in stmt.value.keywords): is_match = True
+                            elif p == "stroke_opacity":
+                                if any(kw.arg == "opacity" for kw in stmt.value.keywords): is_match = True
+                            
+                            if is_match: is_existing_setter = True
+                        else:
+                            is_existing_setter = True
+
+                    if is_existing_setter:
+                        # Update existing setter instead of injecting!
+                        lit = self._literal()
+                        if p == "fill_opacity":
+                            # set_fill(opacity=lit)
+                            for kw in stmt.value.keywords:
+                                if kw.arg == "opacity": kw.value = lit
+                        elif p == "stroke_width":
+                            for kw in stmt.value.keywords:
+                                if kw.arg == "width": kw.value = lit
+                        elif p == "stroke_opacity":
+                            for kw in stmt.value.keywords:
+                                if kw.arg == "opacity": kw.value = lit
+                        else:
+                            # set_color(lit)
+                            if stmt.value.args: stmt.value.args[0] = lit
+                            else: stmt.value.args.append(lit)
+                        
+                        output.append(stmt)
+                        self.injected = True
+                        logger.info(f"AST Surgery: Updated existing {target_setter} for {self.target}.{self.prop}")
+                        continue
+
                     output.append(stmt)
+                    
+                    # Fallback: Inject after the creation line if no existing setter found
                     if not self.injected and getattr(stmt, "lineno", -1) == self.line:
                         injected_stmt = self._patch_stmt()
                         ast.copy_location(injected_stmt, stmt)
-                        next_index = len(output)
-                        next_stmt = stmts[next_index] if next_index < len(stmts) else None
-                        if next_stmt is not None and ast.dump(next_stmt) == ast.dump(injected_stmt):
-                            self.injected = True
-                            continue
                         output.append(injected_stmt)
                         self.injected = True
                 return output
@@ -832,6 +1552,7 @@ class ASTMutator:
         target_var: str,
         prop_name: str,
         new_value: Any,
+        source_key: Optional[str] = None,
     ) -> bool:
         """Surgically modify a property in the AST.
 
@@ -849,6 +1570,20 @@ class ASTMutator:
             logger.error("No file parsed yet. Call parse_file() first.")
             return False
 
+        if self._file_path:
+            try:
+                self.parse_file(self._file_path)
+            except Exception as e:
+                logger.error(f"Failed to re-parse before update: {e}")
+                return False
+
+        strategy = self.plan_property_persistence(target_var, prop_name, source_key=source_key)
+        if strategy.no_persist:
+            logger.info("Skipping property update for %s.%s: %s", target_var, prop_name, strategy.reason)
+            return False
+        if strategy.safe_patch:
+            return self._inject_post_creation_assignment(target_var, prop_name, new_value)
+
         updater = PropertyUpdater(target_var, prop_name, new_value)
         self._tree = updater.visit(self._tree)
         ast.fix_missing_locations(self._tree)
@@ -859,7 +1594,7 @@ class ASTMutator:
             if ref:
                 ref.properties[prop_name] = new_value
             return True
-            
+
         if updater.was_skipped:
             return False
 
@@ -881,6 +1616,13 @@ class ASTMutator:
         if self._tree is None:
             logger.error("No file parsed yet. Call parse_file() first.")
             return False
+
+        if self._file_path:
+            try:
+                self.parse_file(self._file_path)
+            except Exception as e:
+                logger.error(f"Failed to re-parse before transform update: {e}")
+                return False
 
         ref = self.get_binding_by_name(target_var)
         if not ref:
@@ -972,29 +1714,64 @@ class ASTMutator:
         if self._tree is None:
             return False
 
+        if self._file_path:
+            try:
+                self.parse_file(self._file_path)
+            except Exception as e:
+                logger.error(f"Failed to re-parse before animation update: {e}")
+                return False
+
         class AnimMethodUpdater(ast.NodeTransformer):
-            def __init__(self):
+            def __init__(self, target, old_m, new_m):
+                self.target = target
+                self.old_m = old_m.lower()
+                self.new_m = new_m
                 self.modified = False
 
             def visit_Call(self, node: ast.Call) -> ast.Call:
                 self.generic_visit(node)
-                # Check for standard Manim animation pattern: Name(target_var)
-                if isinstance(node.func, ast.Name) and node.func.id.lower() == old_method.lower():
-                    # Check if target matches
-                    target_matches = False
-                    if node.args and isinstance(node.args[0], ast.Name) and node.args[0].id == target_var:
-                        target_matches = True
-                    elif node.args and isinstance(node.args[0], ast.Attribute):
-                        # Attempt to resolve VGroup variables, simplified
-                        if getattr(node.args[0], 'attr', '') == target_var or getattr(node.args[0].value, 'id', '') == target_var:
-                            target_matches = True
-                            
-                    if target_matches:
-                        node.func.id = new_method
+                
+                # We are looking for something like OldMethod(target)
+                # Case 1: Simple Name (e.g., Create)
+                # Case 2: Attribute (e.g., manim.Create)
+                func_id = None
+                if isinstance(node.func, ast.Name):
+                    func_id = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    func_id = node.func.attr
+
+                if func_id and func_id.lower() == self.old_m:
+                    # Verify this animation is actually acting on our target object
+                    is_our_target = False
+                    if node.args:
+                        arg0 = node.args[0]
+                        # 1. Simple name match: Create(triangle)
+                        if isinstance(arg0, ast.Name) and arg0.id == self.target:
+                            is_our_target = True
+                        # 2. Attribute match: Create(self.triangle)
+                        elif (isinstance(arg0, ast.Attribute) and 
+                              isinstance(arg0.value, ast.Name) and 
+                              arg0.value.id == "self" and arg0.attr == self.target):
+                            is_our_target = True
+                        # 3. Chained match: Create(triangle.animate...)
+                        else:
+                            try:
+                                arg_code = ast.unparse(arg0)
+                                if self.target in arg_code:
+                                    is_our_target = True
+                            except: pass
+                    
+                    if is_our_target:
+                        if isinstance(node.func, ast.Name):
+                            node.func.id = self.new_m
+                        elif isinstance(node.func, ast.Attribute):
+                            node.func.attr = self.new_m
                         self.modified = True
+                        logger.info(f"AST Surgery: Replaced {self.old_m} with {self.new_m} for {self.target}")
+                
                 return node
 
-        updater = AnimMethodUpdater()
+        updater = AnimMethodUpdater(target_var, old_method, new_method)
         self._tree = updater.visit(self._tree)
         if updater.modified:
             logger.info(f"AST Surgery: Replaced {old_method} with {new_method} for {target_var}")
@@ -1002,7 +1779,9 @@ class ASTMutator:
             for anim in self._animations:
                 if anim.target_var == target_var and anim.method_name.lower() == old_method.lower():
                     anim.method_name = new_method.lower()
-        return updater.modified
+            
+            return True
+        return False
 
     def update_animation_kwarg(
         self, target_var: str, kwarg_name: str, value: float
@@ -1023,30 +1802,37 @@ class ASTMutator:
                     # Check if target is inside args
                     has_target = False
                     for arg in node.args:
-                        # Direct target `play(target.animate)`
-                        if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Attribute):
-                            # Very simplified check for animate or basic anims
-                            has_target = True # We assume if it's the right line, it's correct. 
-                            # A proper check requires deep traversal. For this demo we'll just check if target string is in unparsed source
-                            try:
-                                arg_code = ast.unparse(arg)
-                                if self.target in arg_code:
-                                    has_target = True
-                                    break
-                            except:
-                                pass
+                        # Case 1: Direct target play(FadeIn(triangle))
+                        # Case 2: Animate play(triangle.animate.move_to(...))
+                        arg_code = ast.unparse(arg)
+                        if self.target in arg_code:
+                            # Verify it's not just a substring, but our exact target
+                            # (A bit naive but unparse + 'in' is very robust for this GUI)
+                            has_target = True
+                            break
                                 
                     if has_target:
                         # Update or inject kwarg
+                        lit = ast.Constant(value=value)
                         found = False
                         for kw in node.keywords:
                             if kw.arg == kwarg_name:
-                                kw.value = ast.Constant(value=value)
+                                if isinstance(kw.value, ast.Constant):
+                                    kw.value = lit
+                                elif isinstance(kw.value, ast.IfExp) and getattr(kw.value.test, "value", False) is True:
+                                    kw.value.body = lit
+                                else:
+                                    # Wrap complex expression
+                                    kw.value = ast.IfExp(
+                                        test=ast.Constant(value=True),
+                                        body=lit,
+                                        orelse=kw.value
+                                    )
                                 found = True
                                 self.modified = True
                                 break
                         if not found:
-                            node.keywords.append(ast.keyword(arg=kwarg_name, value=ast.Constant(value=value)))
+                            node.keywords.append(ast.keyword(arg=kwarg_name, value=lit))
                             self.modified = True
 
                 return node
@@ -1059,8 +1845,10 @@ class ASTMutator:
             for anim in self._animations:
                 if anim.target_var == target_var:
                     anim.kwargs[kwarg_name] = value
+            
+            return True
                     
-        return updater.modified
+        return False
 
     def update_animation_target(
         self,
@@ -1089,6 +1877,22 @@ class ASTMutator:
             logger.error("No file parsed yet. Call parse_file() first.")
             return False
 
+        if self._file_path:
+            try:
+                self.parse_file(self._file_path)
+            except Exception as e:
+                logger.error(f"Failed to re-parse before animation update: {e}")
+                return False
+
+        # Attempt to resolve the freshest line number in case of external edits
+        fresh_line = line_number
+        for anim in self._animations:
+            if anim.target_var == target_var and anim.method_name == method_name:
+                # Naive matching: if multiple exist, this could match the first.
+                # In a robust system, we'd compare UUIDs or full path, but this is a vast improvement.
+                fresh_line = anim.line_number
+                break
+
         class AnimationUpdater(ast.NodeTransformer):
             def __init__(self, target_var, method_name, x, y, line_number):
                 self.target_var = target_var
@@ -1107,22 +1911,36 @@ class ASTMutator:
                         if isinstance(node.func.value, ast.Attribute) and node.func.value.attr == 'animate':
                             if isinstance(node.func.value.value, ast.Name) and node.func.value.value.id == self.target_var:
                                 # This is the exact .animate.method() call!
-                                # Replace args with [x, y, 0]
-                                node.args = [
-                                    ast.List(
-                                        elts=[
-                                            ast.Constant(value=self.x),
-                                            ast.Constant(value=self.y),
-                                            ast.Constant(value=0.0),
-                                        ],
-                                        ctx=ast.Load(),
-                                    )
-                                ]
+                                new_arg = ast.List(
+                                    elts=[
+                                        ast.Constant(value=self.x),
+                                        ast.Constant(value=self.y),
+                                        ast.Constant(value=0.0),
+                                    ],
+                                    ctx=ast.Load(),
+                                )
+                                
+                                if node.args:
+                                    arg0 = node.args[0]
+                                    if isinstance(arg0, (ast.Constant, ast.List, ast.Tuple)):
+                                        node.args[0] = new_arg
+                                    elif isinstance(arg0, ast.IfExp) and getattr(arg0.test, "value", False) is True:
+                                        arg0.body = new_arg
+                                    else:
+                                        # Complex expression — wrap it instead of losing it!
+                                        node.args[0] = ast.IfExp(
+                                            test=ast.Constant(value=True),
+                                            body=new_arg,
+                                            orelse=arg0
+                                        )
+                                else:
+                                    node.args = [new_arg]
+                                    
                                 self.modified = True
                                 logger.info(f"AST Animation Surgery: {self.target_var}.animate.{self.method_name} → [{self.x}, {self.y}, 0]")
                 return node
 
-        updater = AnimationUpdater(target_var, method_name, x, y, line_number)
+        updater = AnimationUpdater(target_var, method_name, x, y, fresh_line)
         self._tree = updater.visit(self._tree)
         ast.fix_missing_locations(self._tree)
 
@@ -1131,17 +1949,318 @@ class ASTMutator:
             finder = PropertyFinder()
             finder.visit(self._tree)
             self._animations = finder.animations
+            
             return True
 
         logger.warning(f"Animation target not found for {target_var}.{method_name} at line {line_number}")
         return False
 
+    def update_animation_position(
+        self,
+        animation_ref: ASTAnimationRef,
+        absolute_x: float,
+        absolute_y: float,
+        base_center: Any,
+    ) -> bool:
+        """Persist a dragged animation position without changing semantics."""
+        if self._tree is None:
+            logger.error("No file parsed yet. Call parse_file() first.")
+            return False
+        if not getattr(animation_ref, "is_draggable", False):
+            logger.info("Animation is not draggable: %s", animation_ref.animation_key)
+            return False
+
+        mode = animation_ref.position_mode
+        if mode == "move_to":
+            vector = [round(float(absolute_x), 2), round(float(absolute_y), 2), 0]
+        else:
+            bx = float(base_center[0]) if base_center is not None else 0.0
+            by = float(base_center[1]) if base_center is not None else 0.0
+            vector = [
+                round(float(absolute_x) - bx, 2),
+                round(float(absolute_y) - by, 2),
+                0.0,
+            ]
+
+        new_node = ast.List(
+            elts=[ast.Constant(value=value) for value in vector],
+            ctx=ast.Load(),
+        )
+
+        class AnimationPositionUpdater(ast.NodeTransformer):
+            def __init__(self, ref: ASTAnimationRef, replacement: ast.expr) -> None:
+                self.ref = ref
+                self.replacement = replacement
+                self.modified = False
+
+            def _animate_target_matches(self, node: ast.Call) -> bool:
+                if not isinstance(node.func, ast.Attribute):
+                    return False
+                if node.func.attr != self.ref.method_name:
+                    return False
+                owner = node.func.value
+                while isinstance(owner, ast.Call) and isinstance(owner.func, ast.Attribute):
+                    owner = owner.func.value
+                return (
+                    isinstance(owner, ast.Attribute)
+                    and owner.attr == "animate"
+                    and isinstance(owner.value, ast.Name)
+                    and owner.value.id == self.ref.target_var
+                )
+
+            def _effect_target_matches(self, node: ast.Call) -> bool:
+                func_name = ""
+                if isinstance(node.func, ast.Name):
+                    func_name = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    func_name = node.func.attr
+                if func_name.lower() != self.ref.method_name.lower():
+                    return False
+                return bool(
+                    node.args
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id == self.ref.target_var
+                )
+
+            def visit_Call(self, node: ast.Call) -> ast.Call:
+                self.generic_visit(node)
+                if self.ref.position_mode in {"move_to", "shift"} and self._animate_target_matches(node):
+                    if node.args:
+                        node.args[0] = self.replacement
+                    else:
+                        node.args.append(self.replacement)
+                    self.modified = True
+                elif self.ref.position_mode == "effect_shift" and self._effect_target_matches(node):
+                    for kw in node.keywords:
+                        if kw.arg == "shift":
+                            kw.value = self.replacement
+                            self.modified = True
+                            break
+                    if not self.modified:
+                        node.keywords.append(ast.keyword(arg="shift", value=self.replacement))
+                        self.modified = True
+                return node
+
+        updater = AnimationPositionUpdater(animation_ref, new_node)
+        self._tree = updater.visit(self._tree)
+        ast.fix_missing_locations(self._tree)
+        if updater.modified:
+            self._rebuild_metadata_from_tree()
+            return True
+        logger.warning("Animation position target not found: %s", animation_ref.animation_key)
+        return False
+
+    def repair_source_compatibility(self) -> bool:
+        """Repair known Manim constructor incompatibilities safely.
+
+        Example: some scenes pass ``dash_length`` to ``Line``. Manim expects
+        that argument on ``DashedLine``, so we upgrade only that exact call.
+        """
+        if self._tree is None:
+            return False
+
+        class CompatibilityRepair(ast.NodeTransformer):
+            def __init__(self) -> None:
+                self.modified = False
+                self.needs_dashed_line_import = False
+
+            def visit_Call(self, node: ast.Call) -> ast.Call:
+                self.generic_visit(node)
+                func_name = ""
+                if isinstance(node.func, ast.Name):
+                    func_name = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    func_name = node.func.attr
+                if func_name == "Line" and any(kw.arg == "dash_length" for kw in node.keywords):
+                    if isinstance(node.func, ast.Name):
+                        node.func.id = "DashedLine"
+                    else:
+                        node.func.attr = "DashedLine"
+                    self.modified = True
+                    self.needs_dashed_line_import = True
+                return node
+
+            def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom:
+                self.generic_visit(node)
+                if node.module == "manim" and self.needs_dashed_line_import:
+                    if not any(alias.name == "DashedLine" for alias in node.names):
+                        node.names.append(ast.alias(name="DashedLine"))
+                        self.modified = True
+                return node
+
+        repair = CompatibilityRepair()
+        self._tree = repair.visit(self._tree)
+        if repair.needs_dashed_line_import:
+            # Run a second pass so import nodes seen before call nodes get updated.
+            self._tree = repair.visit(self._tree)
+        ast.fix_missing_locations(self._tree)
+        if repair.modified:
+            self._rebuild_metadata_from_tree()
+        return repair.modified
+
+    def _generate_format_preserving_source(self) -> str:
+        """Generate source that preserves original formatting.
+
+        Instead of ast.unparse(whole_tree) which destroys comments,
+        blank lines, and indentation, this method:
+        1. Re-parses the original source to get a baseline AST
+        2. Walks all statement bodies comparing individual statements
+        3. Only replaces source lines where statements actually changed
+        4. Inserts newly injected statements with correct indentation
+        5. Keeps everything else (comments, blanks, formatting) verbatim
+
+        Returns:
+            The patched source string preserving original formatting.
+        """
+        if self._source is None or self._tree is None:
+            return ast.unparse(self._tree) + "\n"
+
+        source_lines = self._source.splitlines(keepends=True)
+        # Ensure last line has a newline
+        if source_lines and not source_lines[-1].endswith("\n"):
+            source_lines[-1] += "\n"
+
+        try:
+            original_tree = ast.parse(self._source)
+        except SyntaxError:
+            # Original source is broken — fall back to full unparse
+            return ast.unparse(self._tree) + "\n"
+
+        # Collect all statements from every body (module, class, function)
+        # in the original tree, keyed by (lineno, end_lineno)
+        orig_fingerprints = {}
+        self._collect_stmt_fingerprints(original_tree, orig_fingerprints)
+
+        # Walk the modified tree and find diffs / injections
+        edits = []       # (start_line, end_line, replacement_text)
+        injections = []  # (after_line, text)
+        self._diff_tree_bodies(self._tree, orig_fingerprints, source_lines, edits, injections)
+
+        # Apply edits from bottom-to-top so line numbers stay valid
+        result = list(source_lines)
+        for start, end, text in sorted(edits, key=lambda x: x[0], reverse=True):
+            result[start - 1 : end] = text.splitlines(keepends=True)
+
+        # Apply injections from bottom-to-top
+        for after_line, text in sorted(injections, key=lambda x: x[0], reverse=True):
+            insert_idx = min(after_line, len(result))
+            result.insert(insert_idx, text if text.endswith("\n") else text + "\n")
+
+        return "".join(result)
+
+    def _collect_stmt_fingerprints(
+        self, tree: ast.AST, out: dict[tuple[int, int], str]
+    ) -> None:
+        """Build a map of (lineno, end_lineno) → ast.unparse(stmt) for ALL
+        statements in every body node of the original tree."""
+        for node in ast.walk(tree):
+            body_lists = []
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                body_lists.append(getattr(node, "body", []))
+            if isinstance(node, (ast.If, ast.For, ast.While, ast.Try)):
+                body_lists.append(getattr(node, "body", []))
+                body_lists.append(getattr(node, "orelse", []))
+            if isinstance(node, ast.Try):
+                for handler in getattr(node, "handlers", []):
+                    body_lists.append(getattr(handler, "body", []))
+                body_lists.append(getattr(node, "finalbody", []))
+            for body in body_lists:
+                for stmt in body:
+                    lineno = getattr(stmt, "lineno", None)
+                    end_lineno = getattr(stmt, "end_lineno", None)
+                    if lineno is not None and end_lineno is not None:
+                        try:
+                            out[(lineno, end_lineno)] = ast.unparse(stmt)
+                        except Exception:
+                            pass
+
+    def _diff_tree_bodies(
+        self,
+        tree: ast.AST,
+        orig_fingerprints: dict[tuple[int, int], str],
+        source_lines: list[str],
+        edits: list,
+        injections: list,
+    ) -> None:
+        """Walk modified tree bodies, compare to original fingerprints,
+        and populate edits/injections lists."""
+        seen_keys = set()
+        for node in ast.walk(tree):
+            body_lists = []
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                body_lists.append(getattr(node, "body", []))
+            if isinstance(node, (ast.If, ast.For, ast.While, ast.Try)):
+                body_lists.append(getattr(node, "body", []))
+                body_lists.append(getattr(node, "orelse", []))
+            if isinstance(node, ast.Try):
+                for handler in getattr(node, "handlers", []):
+                    body_lists.append(getattr(handler, "body", []))
+                body_lists.append(getattr(node, "finalbody", []))
+
+            for body in body_lists:
+                for stmt in body:
+                    lineno = getattr(stmt, "lineno", None)
+                    end_lineno = getattr(stmt, "end_lineno", None)
+                    if lineno is None or end_lineno is None:
+                        continue
+
+                    key = (lineno, end_lineno)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+
+                    try:
+                        new_unparse = ast.unparse(stmt)
+                    except Exception:
+                        continue
+
+                    if key in orig_fingerprints:
+                        orig_unparse = orig_fingerprints[key]
+                        if orig_unparse != new_unparse:
+                            # MODIFIED statement — replace those source lines
+                            indent = self._detect_indent(source_lines, lineno)
+                            replacement = self._indent_code(new_unparse, indent)
+                            edits.append((lineno, end_lineno, replacement))
+                    else:
+                        # INJECTED statement — no matching lines in original
+                        indent = self._detect_indent(source_lines, lineno)
+                        text = self._indent_code(new_unparse, indent)
+                        injections.append((lineno, text))
+
+    @staticmethod
+    def _detect_indent(source_lines: list[str], lineno: int) -> str:
+        """Detect the indentation string used at a given line number."""
+        if 1 <= lineno <= len(source_lines):
+            line = source_lines[lineno - 1]
+            stripped = line.lstrip()
+            if stripped:
+                return line[: len(line) - len(stripped)]
+        # Fallback: 8 spaces (standard Manim construct body indent)
+        return "        "
+
+    @staticmethod
+    def _indent_code(code: str, indent: str) -> str:
+        """Indent a code string. First line gets indent, continuation
+        lines get indent + 4 spaces for readability."""
+        lines = code.split("\n")
+        result_lines = []
+        for i, line in enumerate(lines):
+            if i == 0:
+                result_lines.append(indent + line)
+            elif line.strip():
+                result_lines.append(indent + "    " + line)
+            else:
+                result_lines.append("")
+        return "\n".join(result_lines) + "\n"
+
     def save_atomic(self, path: str | Path | None = None) -> bool:
         """Atomically save the modified AST back to disk.
 
+        Uses format-preserving source patching to keep comments,
+        blank lines, and indentation intact. Only the specific lines
+        containing modified AST statements are regenerated.
+
         Uses tempfile + os.rename for corruption-proof writes.
-        Even if the process crashes mid-write, the original file
-        remains intact (rename is atomic on most filesystems).
 
         Args:
             path: Path to save to (defaults to the parsed file)
@@ -1159,8 +2278,16 @@ class ASTMutator:
             return False
 
         try:
-            # Generate clean Python source from AST
-            new_source = ast.unparse(self._tree)
+            # Generate format-preserving patched source
+            new_source = self._generate_format_preserving_source()
+
+            # Validate the patched source compiles (safety net)
+            try:
+                ast.parse(new_source)
+            except SyntaxError as e:
+                logger.warning(f"Patched source has syntax error, falling back to ast.unparse: {e}")
+                new_source = ast.unparse(self._tree) + "\n"
+
             if self._source is not None and self._source.rstrip() == new_source.rstrip():
                 self.last_error = None
                 return True
@@ -1175,15 +2302,18 @@ class ASTMutator:
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(new_source)
-                    f.write("\n")  # Trailing newline
+                    if not new_source.endswith("\n"):
+                        f.write("\n")
                     f.flush()
                     os.fsync(f.fileno())
 
                 # Atomic rename (POSIX guarantee)
                 os.rename(tmp_path, str(path))
-                self._source = new_source + "\n"
+                self._source = new_source
+                self._tree = ast.parse(new_source, filename=str(path))
+                self._rebuild_metadata_from_tree()
                 self.last_error = None
-                logger.info(f"Atomic save: {path.name}")
+                logger.info(f"Atomic save (format-preserving): {path.name}")
                 return True
 
             except Exception:

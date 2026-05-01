@@ -40,6 +40,8 @@ from manim import config as manim_config
 
 # Headless mode: no preview window, no file output
 manim_config.renderer = "opengl"
+manim_config.use_projection_stroke_shaders = False
+manim_config.use_projection_fill_shaders = False
 manim_config.preview = False
 manim_config.write_to_movie = False
 manim_config.save_last_frame = False
@@ -80,10 +82,76 @@ def _patch_manim_earcut():
 
 _patch_manim_earcut()
 
+# ── Monkey-patch Manim 0.19 align_data_and_family() ──
+# The OpenGL VMobject variant is missing this method, which is required
+# by DrawBorderThenFill, Write, and other animation classes.
+# Without it, factory-created objects (axes.plot(), etc.) fail to animate
+# and become invisible on the canvas.
+def _patch_vmobject_align():
+    """Patch VMobject to add align_data_and_family if missing."""
+    try:
+        from manim.mobject.types.vectorized_mobject import VMobject
+    except ImportError:
+        return
+
+    if hasattr(VMobject, 'align_data_and_family'):
+        return
+
+    def _align_data_and_family(self, mob):
+        if hasattr(self, 'align_family'):
+            self.align_family(mob)
+        if hasattr(self, 'align_data'):
+            self.align_data(mob)
+
+    VMobject.align_data_and_family = _align_data_and_family
+
+    # Also patch OpenGL variant if separate
+    try:
+        from manim.mobject.opengl.opengl_vectorized_mobject import OpenGLVMobject
+        if not hasattr(OpenGLVMobject, 'align_data_and_family'):
+            OpenGLVMobject.align_data_and_family = _align_data_and_family
+    except ImportError:
+        pass
+
+_patch_vmobject_align()
+
+# ── Monkey-patch OpenGLVMobject to fix invisible 2D curves ──
+def _patch_opengl_normals():
+    """Ensure unit_normal is correct (0,0,1) for 2D curves before rendering."""
+    try:
+        from manim.mobject.opengl.opengl_vectorized_mobject import OpenGLVMobject
+        import numpy as np
+    except ImportError:
+        return
+
+    original_get_wrapper = OpenGLVMobject.get_stroke_shader_wrapper
+
+    def patched_get_wrapper(self):
+        # 1. Force unit_normal to [0, 0, 1] for all 2D vectorized objects.
+        # This solves both the [0, -1, 0] (degenerate) and [0, 0, -1] (flipped) 
+        # issues that make strokes invisible in the OpenGL renderer.
+        if hasattr(self, "unit_normal") and self.unit_normal is not None:
+            if len(self.unit_normal) > 0:
+                self.unit_normal[:] = [0.0, 0.0, 1.0]
+        
+        # 2. Safety check for stroke_width
+        if hasattr(self, "stroke_width") and self.stroke_width is not None:
+            # If width is somehow set to NaN or extremely small by an animation bug,
+            # force a default visible width (only if points exist).
+            if len(self.points) > 0 and np.all(self.stroke_width == 0):
+                 self.set_stroke(width=4.0, recurse=False)
+
+        return original_get_wrapper(self)
+
+    OpenGLVMobject.get_stroke_shader_wrapper = patched_get_wrapper
+
+_patch_opengl_normals()
+
 # ── Monkey-patch Mobject to track creation line numbers ──
 from engine.runtime_provenance import (
     configure_tracking as configure_runtime_tracking,
     patch_manim_creation_tracking,
+    reset_creation_tracking,
 )
 
 patch_manim_creation_tracking()
@@ -120,8 +188,8 @@ from engine.drag_controller import DragController
 from engine.code_editor import CodeEditorPanel, ShadowBuildResult
 from engine.animation_player import AnimationPlayer
 from engine.export_dialog import ExportDialog, ExportWorker
+from engine.scene_loader import discover_scene_class_from_file, module_name_from_path
 from engine.scene_sync import decide_scene_sync
-from scenes.advanced_scene import AdvancedScene
 
 # ── Logging ──
 logging.basicConfig(
@@ -209,12 +277,18 @@ class MainWindow(QMainWindow):
 
         # ── AST Mutator ──
         self.ast_mutator = ASTMutator()
-        scene_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), self.SCENE_FILE
+        project_root = Path(os.path.dirname(os.path.abspath(__file__)))
+        scene_path = os.path.join(project_root, self.SCENE_FILE)
+        scene_module = module_name_from_path(scene_path, project_root=project_root)
+        scene_class = discover_scene_class_from_file(
+            scene_path,
+            module_name=scene_module,
         )
+        if scene_class is None:
+            raise RuntimeError(f"No Scene subclass found in {scene_path}")
         configure_runtime_tracking(
             scene_path,
-            project_root=Path(os.path.dirname(os.path.abspath(__file__))),
+            project_root=project_root,
         )
         self.ast_mutator.parse_file(scene_path)
         self._normalize_scene_source_if_needed(scene_path)
@@ -236,7 +310,7 @@ class MainWindow(QMainWindow):
 
         # ── Manim Canvas ──
         self.canvas = ManimCanvas(
-            scene_class=AdvancedScene,
+            scene_class=scene_class,
             engine_state=self.engine_state,
             parent=central,
         )
@@ -249,6 +323,7 @@ class MainWindow(QMainWindow):
         # ── Hot-Swap Injector ──
         self.hot_swap = HotSwapInjector(self.engine_state)
         self.hot_swap.set_ast_mutator(self.ast_mutator)
+        self.hot_swap.set_animation_player(self.animation_player)
 
         # ── File Watcher ──
         self.file_watcher = SceneFileWatcher(
@@ -269,6 +344,7 @@ class MainWindow(QMainWindow):
         # Wire drag controller and coord transformer to canvas
         self.canvas.set_drag_controller(self.drag_controller)
         self.canvas.set_coord_transformer(self.coord_transformer)
+        self.drag_controller.set_animation_player(self.animation_player)
 
         # ── Property Panel (Right Dock) ──
         self.property_panel = PropertyPanel(
@@ -282,6 +358,7 @@ class MainWindow(QMainWindow):
 
         # Wire transform drag to full reload
         self.property_panel.transform_drag_requested.connect(self._on_transform_drag_requested)
+        self.property_panel.transform_release_requested.connect(self._flush_pending_transform_reload)
         self.property_panel.full_reload_requested.connect(
             self._on_property_panel_full_reload_requested
         )
@@ -323,6 +400,9 @@ class MainWindow(QMainWindow):
 
         # Wire hot-swap + drag to canvas (deferred until canvas initializes)
         self._scene_path = scene_path
+        self._scene_module = scene_module
+        self._preferred_scene_name = scene_class.__name__
+        reset_creation_tracking()
         self.engine_state.on_scene_parsed(self._on_scene_ready)
 
         logger.info("MainWindow created (Bi-Sync: Full Two-Panel)")
@@ -363,9 +443,6 @@ class MainWindow(QMainWindow):
                 force_progress_sync=True,
             )
 
-    # Module name for importlib.reload
-    SCENE_MODULE = "scenes.advanced_scene"
-
     def _finalize_scene_ready(
         self,
         scene,
@@ -374,6 +451,7 @@ class MainWindow(QMainWindow):
         sync_property_panel: bool = False,
     ) -> None:
         self.engine_state.mark_scene_ready()
+        self._preferred_scene_name = type(scene).__name__
         self.hot_swap.set_scene(scene, self._scene_path)
         self.engine_state.object_registry.register_scene(scene, self.ast_mutator)
         self.drag_controller.set_scene(scene)
@@ -572,8 +650,9 @@ class MainWindow(QMainWindow):
 
         ok, message = self.canvas.shadow_validate_scene_source(
             source_text=source_text,
-            module_name=self.SCENE_MODULE,
+            module_name=self._scene_module,
             scene_file=self._scene_path,
+            preferred_scene_name=self._preferred_scene_name,
         )
         return ok, message
 
@@ -639,6 +718,7 @@ class MainWindow(QMainWindow):
             new_bindings=new_bindings,
             old_animations=old_animations,
             new_animations=self.ast_mutator.animations,
+            can_fast_apply_property=self.hot_swap.can_fast_apply_property,
         )
 
         if not self.engine_state.scene_is_healthy or decision.mode != "property_only":
@@ -698,7 +778,9 @@ class MainWindow(QMainWindow):
         self.animation_player.reset()
 
         success = self.canvas.reload_scene_from_module(
-            self.SCENE_MODULE, path
+            self._scene_module,
+            path,
+            preferred_scene_name=self._preferred_scene_name,
         )
 
         if success:
@@ -793,10 +875,26 @@ class MainWindow(QMainWindow):
             if self.ast_mutator.is_dirty and not self.ast_mutator.save_atomic():
                 return "AST changes could not be saved before export."
 
+            # Verify disk source matches in-memory AST state
             expected_source = self.ast_mutator.rendered_source.rstrip()
             disk_source = Path(self._scene_path).read_text(encoding="utf-8").rstrip()
             if expected_source and disk_source != expected_source:
                 return "Disk source is out of sync with in-memory AST state."
+
+            # Check for preview drift: live edits that couldn't be persisted
+            if self.engine_state.has_preview_drift:
+                from PyQt6.QtWidgets import QMessageBox
+
+                drift_msg = self.engine_state.preview_drift_summary
+                reply = QMessageBox.warning(
+                    self,
+                    "Preview Drift Detected",
+                    f"{drift_msg}\n\nProceed with export anyway?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return "Export cancelled: preview drift not accepted by user."
 
             self.ast_mutator.parse_file(self._scene_path)
             self._rebind_selected_animation(animation_key)
@@ -1030,7 +1128,11 @@ class MainWindow(QMainWindow):
         anim_idx = int(progress * total_anims)
         anim_idx = max(0, min(anim_idx, total_anims - 1))  # Clamp to valid range
 
-        self.engine_state.selected_animation = self.ast_mutator.animations[anim_idx]
+        if anim_idx < len(self.ast_mutator.animations):
+            self.engine_state.selected_animation = self.ast_mutator.animations[anim_idx]
+        else:
+            self.engine_state.selected_animation = None
+            
         self.engine_state.request_render()
 
     def _on_play_clicked(self) -> None:
@@ -1104,6 +1206,7 @@ class MainWindow(QMainWindow):
         dialog = ExportDialog(self._scene_path, parent=self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             settings = dialog.get_settings()
+            settings["scene_name"] = self._resolve_active_scene_name()
             self._start_export(settings)
 
     def _start_export(self, settings: dict) -> None:
@@ -1168,6 +1271,20 @@ class MainWindow(QMainWindow):
         from PyQt6.QtWidgets import QMessageBox
         QMessageBox.warning(self, "Export Failed", error_msg)
         logger.error(f"Export failed: {error_msg}")
+
+    def _resolve_active_scene_name(self) -> str:
+        scene = self.canvas.get_scene()
+        if scene is not None:
+            return type(scene).__name__
+
+        scene_class = discover_scene_class_from_file(
+            self._scene_path,
+            module_name=self._scene_module,
+            preferred_name=self._preferred_scene_name,
+        )
+        if scene_class is None:
+            raise RuntimeError(f"No Scene subclass found in {self._scene_path}")
+        return scene_class.__name__
 
 
 def main() -> None:

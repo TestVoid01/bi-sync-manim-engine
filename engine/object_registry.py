@@ -34,6 +34,8 @@ class LiveObjectRef:
     path: tuple[int, ...] = ()
     parent_id: Optional[int] = None
     is_top_level: bool = False
+    nearest_editable_source_key: Optional[str] = None
+    exact_source_key: Optional[str] = None
 
     @property
     def display_name(self) -> str:
@@ -55,6 +57,9 @@ class SelectionRef:
     read_only_reason: str = ""
     path: tuple[int, ...] = ()
     display_name: str = ""
+    exact_source_key: Optional[str] = None
+    nearest_editable_source_key: Optional[str] = None
+    registry_backed: bool = False
 
     @property
     def key(self) -> str:
@@ -78,11 +83,7 @@ class ObjectRegistry:
         """Rebuild the registry from the current live Manim scene."""
         self.clear()
 
-        clear_live_binds = getattr(ast_mutator, "clear_live_binds", None)
-        if callable(clear_live_binds):
-            clear_live_binds()
-        elif hasattr(ast_mutator, "_live_binds"):
-            ast_mutator._live_binds.clear()
+
 
         for mob in getattr(scene, "mobjects", []):
             source_file = getattr(mob, "_bisync_source_file", None)
@@ -137,11 +138,10 @@ class ObjectRegistry:
             return None
 
         selected_ref = self.get(selected_mobject_id) or top_ref
-        source_ref = selected_ref
-        if source_ref.source_key is None:
-            source_ref = top_ref
+        source_ref = self._nearest_source_ref(selected_ref) or self._nearest_source_ref(top_ref)
+        exact_source_key = selected_ref.source_key
 
-        if source_ref.source_key is None:
+        if source_ref is None or source_ref.source_key is None:
             runtime_name = selected_ref.constructor_name
             display_name = runtime_name + "".join(f"[{index}]" for index in path)
             return SelectionRef(
@@ -155,20 +155,26 @@ class ObjectRegistry:
                 read_only_reason="runtime object has no exact source anchor",
                 path=tuple(path),
                 display_name=display_name,
+                exact_source_key=exact_source_key,
+                nearest_editable_source_key=None,
+                registry_backed=False,
             )
 
-        display_name = source_ref.display_name
+        display_name = selected_ref.display_name or source_ref.display_name
         return SelectionRef(
             mobject_id=selected_ref.mobject_id,
             top_level_id=top_ref.top_level_id,
             variable_name=source_ref.variable_name or source_ref.display_name,
             line_number=source_ref.line_number,
-            constructor_name=source_ref.constructor_name,
+            constructor_name=selected_ref.constructor_name,
             source_key=source_ref.source_key,
             editability=source_ref.editability,
             read_only_reason=source_ref.read_only_reason,
             path=tuple(path),
             display_name=display_name,
+            exact_source_key=exact_source_key,
+            nearest_editable_source_key=source_ref.source_key,
+            registry_backed=True,
         )
 
     def find_mobject(self, scene: Any, mobject_id: int) -> Optional[Any]:
@@ -277,13 +283,27 @@ class ObjectRegistry:
             path=path,
             parent_id=parent_id,
             is_top_level=is_top_level,
+            nearest_editable_source_key=ast_ref.source_key if ast_ref is not None else None,
+            exact_source_key=ast_ref.source_key if ast_ref is not None else None,
         )
+        if ast_ref is not None:
+            setattr(mob, "_bisync_source_key", ast_ref.source_key)
+            setattr(mob, "_bisync_runtime_path", tuple(path))
+            setattr(mob, "_bisync_editability", ast_ref.editability)
         self._refs_by_id[ref.mobject_id] = ref
         if ref.is_top_level and ref.variable_name:
             self._top_level_ids_by_var[ref.variable_name] = ref.mobject_id
         if ref.source_key and (ref.path == getattr(ast_ref, "inline_path", ()) if ast_ref is not None else ref.is_top_level):
             self._source_key_to_id.setdefault(ref.source_key, ref.mobject_id)
         return ref
+
+    def _nearest_source_ref(self, ref: Optional[LiveObjectRef]) -> Optional[LiveObjectRef]:
+        current = ref
+        while current is not None:
+            if current.source_key is not None:
+                return current
+            current = self._refs_by_id.get(current.parent_id) if current.parent_id is not None else None
+        return None
 
     @staticmethod
     def _get_ast_ref(

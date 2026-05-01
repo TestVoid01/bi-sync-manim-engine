@@ -36,6 +36,10 @@ class PropertyApplyDecision:
     def read_only(self) -> bool:
         return self.apply_mode == "read_only"
 
+    @property
+    def preview_only(self) -> bool:
+        return self.apply_mode == "preview_only"
+
 
 _VISUAL_EXACT = {
     "color",

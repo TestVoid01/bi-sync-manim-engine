@@ -95,15 +95,17 @@ class SceneFileWatcher:
         Starts the debounce timer. If another change arrives
         within 300ms, the timer resets (only one reload fires).
         """
-        # Check Socket 5: are we paused?
-        if self._engine_state.is_file_watcher_paused:
-            pass
-            return
-
         if time.monotonic() < self._suppress_reload_until:
             return
 
-        pass
+        # External change detected!
+        # Do not drop this event even if paused. We must track it to prevent overwriting.
+        self._engine_state.is_external_reload_pending = True
+        
+        if self._engine_state.is_file_watcher_paused:
+            logger.info("External change detected while paused, delaying reload.")
+            return
+            
         self._debounce_timer.start()  # Restart the timer
 
         # QFileSystemWatcher sometimes drops the watch after a change
@@ -113,6 +115,9 @@ class SceneFileWatcher:
 
     def _do_reload(self) -> None:
         """Actually perform the reload after debounce period."""
+        # Clear the flag BEFORE triggering reload so that the reload handler
+        # (hot-swap) can safely make its own saves without being blocked.
+        self._engine_state.is_external_reload_pending = False
         if self._watched_path:
             logger.info(f"Debounce complete → triggering reload")
             self._on_file_changed(self._watched_path)
@@ -121,15 +126,23 @@ class SceneFileWatcher:
         """Socket 5: Pause the watcher during slider drag."""
         self._engine_state.pause_file_watcher()
         self._debounce_timer.stop()
-        pass
 
     def resume(self) -> None:
         """Socket 5: Resume the watcher after slider release."""
         self._engine_state.resume_file_watcher()
-        pass
+        if getattr(self._engine_state, 'is_external_reload_pending', False):
+            # Clear flag now — the debounce reload will handle the change.
+            self._engine_state.is_external_reload_pending = False
+            logger.info("Resuming watcher with pending external edit, triggering reload.")
+            self._debounce_timer.start()
 
-    def notify_internal_commit(self, suppress_ms: int = 500) -> None:
-        """Suppress watcher-triggered reload briefly after internal save."""
+    def notify_internal_commit(self, suppress_ms: int = 1500) -> None:
+        """Suppress watcher-triggered reload briefly after internal save.
+
+        Also clears the external reload flag since this change originated
+        from our own save_atomic(), not from an external editor.
+        """
+        self._engine_state.is_external_reload_pending = False
         self._suppress_reload_until = max(
             self._suppress_reload_until,
             time.monotonic() + (suppress_ms / 1000.0),

@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QDockWidget,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QSlider,
@@ -43,69 +42,6 @@ if TYPE_CHECKING:
     from engine.file_watcher import SceneFileWatcher
     from engine.hot_swap import HotSwapInjector
     from engine.state import EngineState
-
-
-MANIM_SCHEMA = {
-    "Circle": {
-        "radius": 1.0,
-        "color": "WHITE",
-        "fill_opacity": 0.0,
-        "stroke_width": 4.0,
-        "stroke_opacity": 1.0,
-    },
-    "Square": {
-        "side_length": 2.0,
-        "color": "WHITE",
-        "fill_opacity": 0.0,
-        "stroke_width": 4.0,
-        "stroke_opacity": 1.0,
-    },
-    "Rectangle": {
-        "width": 4.0,
-        "height": 2.0,
-        "color": "WHITE",
-        "fill_opacity": 0.0,
-        "stroke_width": 4.0,
-        "stroke_opacity": 1.0,
-    },
-    "Triangle": {
-        "color": "WHITE",
-        "fill_opacity": 0.0,
-        "stroke_width": 4.0,
-        "stroke_opacity": 1.0,
-    },
-    "Line": {
-        "color": "WHITE",
-        "stroke_width": 4.0,
-        "stroke_opacity": 1.0,
-    },
-    "Axes": {
-        "x_range": [-10.0, 10.0, 1.0],
-        "y_range": [-10.0, 10.0, 1.0],
-        "x_length": 10.0,
-        "y_length": 10.0,
-    },
-    "Text": {
-        "color": "WHITE",
-        "font_size": 48.0,
-        "fill_opacity": 1.0,
-    },
-    "Tex": {
-        "color": "WHITE",
-        "fill_opacity": 1.0,
-    },
-    "MathTex": {
-        "color": "WHITE",
-        "fill_opacity": 1.0,
-    },
-}
-
-DEFAULT_VMOBJECT_SCHEMA = {
-    "color": "WHITE",
-    "fill_opacity": 0.0,
-    "stroke_width": 4.0,
-    "stroke_opacity": 1.0,
-}
 
 
 class PropertyString(QWidget):
@@ -419,6 +355,215 @@ class PropertyDropdown(QWidget):
         self._combo.blockSignals(False)
 
 
+class PropertyTupleEditor(QWidget):
+    """Interactive editor for numeric tuple/list values like x_range=[-2, 3, 1].
+
+    Shows one numeric input per element, arranged horizontally.
+    Emits the entire list on any element change.
+    """
+
+    value_changed = pyqtSignal(list)
+    value_released = pyqtSignal(list)
+
+    def __init__(
+        self,
+        label: str,
+        initial: list[float],
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+
+        self._element_count = len(initial)
+        self._inputs: list[QLineEdit] = []
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(4, 2, 4, 2)
+        outer.setSpacing(4)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+
+        lbl = QLabel(label)
+        lbl.setFixedWidth(92)
+        lbl.setStyleSheet("color: #aaa; font-size: 12px;")
+        row.addWidget(lbl)
+
+        lbl_open = QLabel("[")
+        lbl_open.setStyleSheet("color: #888; font-size: 13px; font-weight: bold;")
+        lbl_open.setFixedWidth(8)
+        row.addWidget(lbl_open)
+
+        for idx, val in enumerate(initial):
+            inp = QLineEdit(f"{float(val):.2f}")
+            inp.setFixedWidth(70)
+            inp.setAlignment(Qt.AlignmentFlag.AlignRight)
+            inp.setStyleSheet("""
+                QLineEdit {
+                    background: #333;
+                    color: #e5c07b;
+                    border: 1px solid #555;
+                    border-radius: 3px;
+                    padding: 2px 4px;
+                    font-family: monospace;
+                    font-weight: bold;
+                }
+                QLineEdit:focus {
+                    border-color: #e5c07b;
+                }
+            """)
+            inp.textChanged.connect(self._on_element_changed)
+            inp.editingFinished.connect(self._on_editing_finished)
+            self._inputs.append(inp)
+            row.addWidget(inp)
+
+            if idx < len(initial) - 1:
+                comma = QLabel(",")
+                comma.setStyleSheet("color: #888; font-size: 13px;")
+                comma.setFixedWidth(8)
+                row.addWidget(comma)
+
+        lbl_close = QLabel("]")
+        lbl_close.setStyleSheet("color: #888; font-size: 13px; font-weight: bold;")
+        lbl_close.setFixedWidth(8)
+        row.addWidget(lbl_close)
+
+        row.addStretch(1)
+        outer.addLayout(row)
+
+        # Status label for validation errors
+        self._status_label = QLabel("")
+        self._status_label.setStyleSheet("color: #e06c75; font-size: 10px; padding-left: 96px;")
+        outer.addWidget(self._status_label)
+
+    def _read_values(self) -> Optional[list[float]]:
+        """Parse all element inputs. Returns None if any element is invalid."""
+        values: list[float] = []
+        for inp in self._inputs:
+            text = inp.text().strip()
+            try:
+                values.append(float(text))
+            except ValueError:
+                return None
+        return values
+
+    def _on_element_changed(self) -> None:
+        values = self._read_values()
+        if values is not None:
+            self._status_label.setText("")
+            self.value_changed.emit(values)
+        else:
+            self._status_label.setText("⚠ invalid number")
+
+    def _on_editing_finished(self) -> None:
+        values = self._read_values()
+        if values is not None:
+            self._status_label.setText("")
+            # Normalize display after editing
+            for inp, val in zip(self._inputs, values):
+                inp.blockSignals(True)
+                inp.setText(f"{val:.2f}")
+                inp.blockSignals(False)
+            self.value_released.emit(values)
+        else:
+            self._status_label.setText("⚠ fix invalid values before committing")
+
+    def set_value(self, values: list[float]) -> None:
+        for inp, val in zip(self._inputs, values):
+            inp.blockSignals(True)
+            inp.setText(f"{float(val):.2f}")
+            inp.blockSignals(False)
+
+
+class PropertyCodeField(QWidget):
+    """Editable text input for raw Python code expressions.
+
+    Used for values like ``DOWN * 2``, ``axes.c2p(4, np.sin(4))``.
+    Validates Python expression syntax on commit and wraps the result
+    in a ``CodeExpression`` for the AST mutator.
+    """
+
+    value_changed = pyqtSignal(object)  # CodeExpression or raw str
+    value_released = pyqtSignal(object)
+
+    def __init__(
+        self,
+        label: str,
+        initial: str,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(4, 2, 4, 2)
+        outer.setSpacing(2)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+
+        lbl = QLabel(label)
+        lbl.setFixedWidth(92)
+        lbl.setStyleSheet("color: #aaa; font-size: 12px;")
+        row.addWidget(lbl)
+
+        self._input = QLineEdit(str(initial))
+        self._input.setStyleSheet("""
+            QLineEdit {
+                background: #2c313a;
+                color: #98c379;
+                border: 1px solid #555;
+                border-radius: 3px;
+                padding: 3px 6px;
+                font-family: 'Menlo', 'Consolas', 'Courier New', monospace;
+                font-size: 12px;
+            }
+            QLineEdit:focus {
+                border-color: #98c379;
+            }
+        """)
+        row.addWidget(self._input, stretch=1)
+
+        outer.addLayout(row)
+
+        self._status_label = QLabel("")
+        self._status_label.setStyleSheet("color: #e06c75; font-size: 10px; padding-left: 96px;")
+        outer.addWidget(self._status_label)
+
+        # Only emit on commit (editing finished / Enter), not on every keystroke
+        self._input.editingFinished.connect(self._on_editing_finished)
+
+    def _validate_expression(self, code: str) -> Optional[str]:
+        """Return None if expression is valid Python, else return error message."""
+        code = code.strip()
+        if not code:
+            return "expression cannot be empty"
+        try:
+            import ast as ast_mod
+            ast_mod.parse(code, mode="eval")
+            return None
+        except SyntaxError as exc:
+            return f"syntax error: {exc.msg}"
+
+    def _on_editing_finished(self) -> None:
+        code = self._input.text().strip()
+        error = self._validate_expression(code)
+        if error is not None:
+            self._status_label.setText(f"⚠ {error}")
+            return
+
+        self._status_label.setText("")
+        from engine.ast_mutator import CodeExpression
+        wrapped = CodeExpression(raw_code=code)
+        self.value_released.emit(wrapped)
+
+    def set_value(self, value: str) -> None:
+        self._input.blockSignals(True)
+        self._input.setText(str(value))
+        self._input.blockSignals(False)
+        self._status_label.setText("")
+
+
 class PropertyPanel(QDockWidget):
     """Dock widget containing dynamic property sliders for scene manipulation.
 
@@ -429,6 +574,7 @@ class PropertyPanel(QDockWidget):
     """
 
     transform_drag_requested = pyqtSignal(str, str, float)
+    transform_release_requested = pyqtSignal()
     full_reload_requested = pyqtSignal(str)
 
     def __init__(
@@ -445,11 +591,12 @@ class PropertyPanel(QDockWidget):
         self._hot_swap = hot_swap
         self._file_watcher = file_watcher
 
-        # Store dynamic sliders {prop_name: PropertySlider}
-        self._dynamic_sliders: dict[str, PropertySlider] = {}
+        # Store dynamic widgets/specs keyed by stable PropertySpec key
+        self._dynamic_sliders: dict[str, QWidget] = {}
+        self._specs_by_key: dict[str, Any] = {}
         self._current_var_name: Optional[str] = None
         self._pending_commits: dict[tuple[str, str, str], tuple[str, str, Any]] = {}
-        self._pending_widgets: dict[tuple[str, str, str], PropertySlider] = {}
+        self._pending_widgets: dict[tuple[str, str, str], QWidget] = {}
         self._commit_timer = QTimer(self)
         self._commit_timer.setSingleShot(True)
         self._commit_timer.setInterval(150)
@@ -495,6 +642,17 @@ class PropertyPanel(QDockWidget):
 
         logger.info("PropertyPanel initialized (Dynamic Mode)")
 
+    @staticmethod
+    def _values_equivalent(left: Any, right: Any, *, tol: float = 1e-6) -> bool:
+        if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+            return len(left) == len(right) and all(
+                PropertyPanel._values_equivalent(a, b, tol=tol)
+                for a, b in zip(left, right)
+            )
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+            return abs(float(left) - float(right)) <= tol
+        return left == right
+
     def _on_selection_changed(self, var_name: Optional[str]) -> None:
         """Triggered when user clicks an object in the canvas."""
         selection = getattr(self._engine_state, "selected_object", None)
@@ -505,7 +663,7 @@ class PropertyPanel(QDockWidget):
         self._build_dynamic_ui()
 
     def _build_dynamic_ui(self) -> None:
-        """Clear existing UI and build sliders based on the selected object's AST kwargs."""
+        """Rebuild the property panel from inspector-provided PropertySpec objects."""
         # Clear existing dynamic widgets
         while self._content_layout.count():
             item = self._content_layout.takeAt(0)
@@ -513,6 +671,7 @@ class PropertyPanel(QDockWidget):
                 item.widget().deleteLater()
         
         self._dynamic_sliders.clear()
+        self._specs_by_key.clear()
 
         selection = getattr(self._engine_state, "selected_object", None)
 
@@ -523,281 +682,218 @@ class PropertyPanel(QDockWidget):
             object_registry=self._engine_state.object_registry,
             scene_getter=scene_getter,
         )
-        live_specs = inspector.inspect_selection(selection) if selection else []
+        specs = inspector.inspect_selection(selection) if selection else []
+
+        if selection is None:
+            self._title.setText("Scene Properties (No Selection)")
+            return
+
+        source_key = (
+            getattr(selection, "nearest_editable_source_key", None)
+            or getattr(selection, "source_key", None)
+        )
+        ref = (
+            self._ast_mutator.get_binding_by_source_key(source_key)
+            if source_key
+            else self._ast_mutator.get_binding_by_name(selection.variable_name)
+        )
+        display_name = getattr(selection, "display_name", "") or getattr(
+            selection,
+            "variable_name",
+            self._current_var_name or "Selection",
+        )
+        constructor_name = (
+            ref.constructor_name
+            if ref is not None
+            else getattr(selection, "constructor_name", "Unknown")
+        )
+        self._title.setText(f"Properties: {display_name} ({constructor_name})")
 
         if selection is not None and getattr(selection, "editability", "source_editable") != "source_editable":
             self._engine_state.set_interaction_state("read_only_target")
-            self._title.setText(f"Properties: {selection.display_name or 'Selection'} (Read-only)")
             reason = getattr(selection, "read_only_reason", "") or "This runtime object is not source-editable."
             lbl = QLabel(reason)
             lbl.setWordWrap(True)
             lbl.setStyleSheet("color: #c0a060; font-size: 12px; padding: 6px 0;")
             self._content_layout.addWidget(lbl)
-            
-            if live_specs:
-                self._add_section_label("Discovered Properties")
-                for spec in live_specs:
-                    if spec.section == "Live Readout":
-                        val_str = str(spec.value)
-                        if isinstance(spec.value, float):
-                            val_str = f"{spec.value:.3f}"
-                        row = QHBoxLayout()
-                        row.setContentsMargins(0, 0, 0, 0)
-                        name_lbl = QLabel(spec.name)
-                        name_lbl.setStyleSheet("color: #ccc; font-size: 12px;")
-                        val_lbl = QLabel(val_str)
-                        val_lbl.setStyleSheet("color: #888; font-size: 12px;")
-                        row.addWidget(name_lbl)
-                        row.addStretch()
-                        row.addWidget(val_lbl)
-                        w = QWidget()
-                        w.setLayout(row)
-                        self._content_layout.addWidget(w)
-            
+
+        if not specs:
+            lbl = QLabel("No source-backed or live-readable properties found.")
+            lbl.setStyleSheet("color: #888;")
+            self._content_layout.addWidget(lbl)
             self._append_live_readout()
             return
 
-        if not self._current_var_name:
-            self._title.setText("Scene Properties (No Selection)")
-            return
+        current_section = None
+        for spec in specs:
+            if spec.section != current_section:
+                current_section = spec.section
+                self._add_section_label(current_section)
+            self._add_spec_widget(spec)
 
-        # Fetch AST properties for this variable
-        ref = self._ast_mutator.get_binding_by_name(self._current_var_name)
-        if not ref:
-            self._title.setText(f"Scene Properties (Unknown: {self._current_var_name})")
-            return
-
-        self._title.setText(f"Properties: {self._current_var_name} ({ref.constructor_name})")
-        self._add_section_label("Source Properties")
-
-        ast_props = ref.properties
-        schema_props = MANIM_SCHEMA.get(ref.constructor_name, DEFAULT_VMOBJECT_SCHEMA).copy()
-        
-        # Merge: Start with schema, override with anything actually written in code
-        props = schema_props.copy()
-        props.update(ast_props)
-
-        if not props:
-            lbl = QLabel("No numerical or string properties found.")
-            lbl.setStyleSheet("color: #888;")
-            self._content_layout.addWidget(lbl)
-            return
-
-        # Build UI for numerical properties
-        # Basic heuristic ranges for Manim properties
-        ranges = {
-            "radius": (0.1, 10.0),
-            "side_length": (0.1, 10.0),
-            "width": (0.1, 15.0),
-            "height": (0.1, 15.0),
-            "stroke_width": (0.0, 20.0),
-            "fill_opacity": (0.0, 1.0),
-            "stroke_opacity": (0.0, 1.0),
-            "x_range": (-20.0, 20.0), # Example defaults
-            "y_range": (-20.0, 20.0),
-        }
-
-        for prop_name, value in props.items():
-            if isinstance(value, (int, float)):
-                # Determine min/max range
-                min_val, max_val = ranges.get(prop_name, (value - 10.0, value + 10.0))
-                if value < min_val: min_val = float(value) - 5.0
-                if value > max_val: max_val = float(value) + 5.0
-                if min_val == max_val: max_val += 1.0
-                
-                # Special cases
-                if "opacity" in prop_name:
-                    min_val, max_val = 0.0, 1.0
-                elif "width" in prop_name or "radius" in prop_name or "length" in prop_name:
-                    min_val = max(0.0, min_val)
-
-                slider = PropertySlider(
-                    label=prop_name,
-                    min_val=min_val,
-                    max_val=max_val,
-                    initial=float(value)
-                )
-                
-                slider.value_changed.connect(
-                    lambda v, v_name=self._current_var_name, p_name=prop_name: 
-                        self._on_drag(v_name, p_name, v)
-                )
-                slider.value_released.connect(
-                    lambda v, v_name=self._current_var_name, p_name=prop_name: 
-                        self._on_release(v_name, p_name, v)
-                )
-
-                self._content_layout.addWidget(slider)
-                self._dynamic_sliders[prop_name] = slider
-
-            elif isinstance(value, str):
-                str_input = PropertyString(
-                    label=prop_name,
-                    initial=value
-                )
-
-                str_input.value_changed.connect(
-                    lambda text, v_name=self._current_var_name, p_name=prop_name: 
-                        self._on_drag(v_name, p_name, text)
-                )
-                str_input.value_released.connect(
-                    lambda text, v_name=self._current_var_name, p_name=prop_name: 
-                        self._on_release(v_name, p_name, text)
-                )
-
-                self._content_layout.addWidget(str_input)
-                # Store it in dynamic sliders dict for code sync
-                self._dynamic_sliders[prop_name] = str_input
-
-        # ---------------------------------------------------------------------
-        # Transform Section (Scale, Rotate)
-        # ---------------------------------------------------------------------
-        self._add_section_label("Source Chain")
-        transform_group = QGroupBox("Transforms")
-        transform_group.setStyleSheet("QGroupBox { color: #aaa; font-weight: bold; padding-top: 15px; }")
-        transform_layout = QVBoxLayout(transform_group)
-        
-        # Scale Slider
-        scale_val = ref.transforms.get("scale", 1.0)
-        scale_slider = PropertySlider(label="scale", min_val=0.1, max_val=10.0, initial=float(scale_val))
-        scale_slider.value_changed.connect(
-            lambda v, v_name=self._current_var_name: self._on_transform_drag(v_name, "scale", v)
-        )
-        scale_slider.value_released.connect(
-            lambda v, v_name=self._current_var_name: self._on_transform_release(v_name, "scale", v)
-        )
-        transform_layout.addWidget(scale_slider)
-        self._dynamic_sliders["_scale"] = scale_slider # special key for syncing
-        
-        # Rotate Slider
-        import math
-        rotate_val = ref.transforms.get("rotate", 0.0)
-        rotate_slider = PropertySlider(label="rotate", min_val=-math.pi*2, max_val=math.pi*2, initial=float(rotate_val))
-        rotate_slider.value_changed.connect(
-            lambda v, v_name=self._current_var_name: self._on_transform_drag(v_name, "rotate", v)
-        )
-        rotate_slider.value_released.connect(
-            lambda v, v_name=self._current_var_name: self._on_transform_release(v_name, "rotate", v)
-        )
-        transform_layout.addWidget(rotate_slider)
-        self._dynamic_sliders["_rotate"] = rotate_slider
-        
-        self._content_layout.addWidget(transform_group)
-
-        # ---------------------------------------------------------------------
-        # Animation Section
-        # ---------------------------------------------------------------------
-        # Find if this target has an animation
-        target_anim = None
-        for anim in self._ast_mutator.animations:
-            if anim.target_var == self._current_var_name:
-                target_anim = anim
-                break
-                
-        if target_anim:
-            anim_group = QGroupBox("Animation")
-            anim_group.setStyleSheet("QGroupBox { color: #aaa; font-weight: bold; padding-top: 15px; }")
-            anim_layout = QVBoxLayout(anim_group)
-            
-            # Animation Type Dropdown
-            anim_effects = ["Create", "Write", "FadeIn", "FadeOut", "GrowFromCenter", "SpinInFromNothing", "DrawBorderThenFill"]
-            # Try to map lowercase AST names back to proper case if possible, else just use what's there
-            current_effect = next((e for e in anim_effects if e.lower() == target_anim.method_name.lower()), target_anim.method_name)
-            
-            anim_dropdown = PropertyDropdown(label="Effect", options=anim_effects, initial=current_effect)
-            anim_dropdown.value_changed.connect(
-                lambda text, v_name=self._current_var_name, old_eff=target_anim.method_name: 
-                    self._on_animation_type_change(v_name, old_eff, text)
-            )
-            anim_layout.addWidget(anim_dropdown)
-            self._dynamic_sliders["_anim_dropdown"] = anim_dropdown
-            
-            # Run Time Slider
-            run_time_val = target_anim.kwargs.get("run_time", 1.0)
-            rt_slider = PropertySlider(label="run_time", min_val=0.1, max_val=10.0, initial=float(run_time_val))
-            rt_slider.value_changed.connect(
-                lambda v, v_name=self._current_var_name: self._on_animation_kwarg_drag(v_name, "run_time", v)
-            )
-            rt_slider.value_released.connect(
-                lambda v, v_name=self._current_var_name: self._on_animation_kwarg_release(v_name, "run_time", v)
-            )
-            anim_layout.addWidget(rt_slider)
-            self._dynamic_sliders["_run_time"] = rt_slider
-            
-            self._content_layout.addWidget(anim_group)
-
-        if live_specs:
-            self._add_section_label("Discovered Properties")
-            for spec in live_specs:
-                if spec.section == "Live Readout" and spec.name not in props:
-                    if spec.widget_hint == "slider" and isinstance(spec.value, (int, float)):
-                        min_val, max_val, _ = spec.range_hint or (0.0, 1.0, 0.1)
-                        if spec.value < min_val: min_val = float(spec.value) - 5.0
-                        if spec.value > max_val: max_val = float(spec.value) + 5.0
-                        if min_val == max_val: max_val += 1.0
-                        slider = PropertySlider(
-                            label=spec.name,
-                            min_val=min_val,
-                            max_val=max_val,
-                            initial=float(spec.value)
-                        )
-                        slider.value_changed.connect(
-                            lambda v, v_name=self._current_var_name, p_name=spec.name: 
-                                self._on_drag(v_name, p_name, v)
-                        )
-                        slider.value_released.connect(
-                            lambda v, v_name=self._current_var_name, p_name=spec.name: 
-                                self._on_release(v_name, p_name, v)
-                        )
-                        self._content_layout.addWidget(slider)
-                        self._dynamic_sliders[spec.name] = slider
-                    else:
-                        val_str = str(spec.value)
-                        if isinstance(spec.value, float):
-                            val_str = f"{spec.value:.3f}"
-                        row = QHBoxLayout()
-                        row.setContentsMargins(0, 0, 0, 0)
-                        name_lbl = QLabel(spec.name)
-                        name_lbl.setStyleSheet("color: #ccc; font-size: 12px;")
-                        val_lbl = QLabel(val_str)
-                        val_lbl.setStyleSheet("color: #888; font-size: 12px;")
-                        row.addWidget(name_lbl)
-                        row.addStretch()
-                        row.addWidget(val_lbl)
-                        w = QWidget()
-                        w.setLayout(row)
-                        self._content_layout.addWidget(w)
-
-        self._add_section_label("Live Readout")
+        self._add_section_label("Selection State")
         self._append_live_readout()
 
-    def _on_drag(self, target_var: str, prop_name: str, value: float) -> None:
-        """Handle continuous slider drag — in-memory update only.
+    def _add_spec_widget(self, spec: Any) -> None:
+        self._specs_by_key[spec.key] = spec
 
-        Fast path: No SSD writes during drag.
-        Just apply property directly to the mobject and re-render.
+        if spec.read_only:
+            self._content_layout.addWidget(self._build_read_only_row(spec))
+            return
 
-        Socket 5: File watcher is paused during drag.
-        """
-        # Pause file watcher to prevent feedback loop
+        # ── Tuple editor (x_range, y_range, etc.) ──
+        if spec.widget_hint == "tuple" and isinstance(spec.value, list):
+            widget = PropertyTupleEditor(
+                label=spec.display_key or spec.name,
+                initial=[float(v) for v in spec.value],
+            )
+            widget.value_released.connect(
+                lambda values, s=spec: self._handle_spec_release(s, values)
+            )
+            self._dynamic_sliders[spec.key] = widget
+            self._content_layout.addWidget(widget)
+            return
+
+        # ── Code expression field (DOWN * 2, etc.) ──
+        if spec.widget_hint == "code" and isinstance(spec.value, str):
+            widget = PropertyCodeField(
+                label=spec.display_key or spec.name,
+                initial=spec.value,
+            )
+            widget.value_released.connect(
+                lambda expr, s=spec: self._handle_spec_release(s, expr)
+            )
+            self._dynamic_sliders[spec.key] = widget
+            self._content_layout.addWidget(widget)
+            return
+
+        if spec.widget_hint == "slider" and isinstance(spec.value, (int, float)):
+            min_val, max_val, step = spec.range_hint or self._fallback_range_hint(spec.value)
+            widget = PropertySlider(
+                label=spec.display_key or spec.name,
+                min_val=float(min_val),
+                max_val=float(max_val),
+                initial=float(spec.value),
+                step=float(step),
+            )
+            widget.value_changed.connect(lambda value, s=spec: self._handle_spec_drag(s, value))
+            widget.value_released.connect(lambda value, s=spec: self._handle_spec_release(s, value))
+            self._dynamic_sliders[spec.key] = widget
+            self._content_layout.addWidget(widget)
+            return
+
+        if spec.widget_hint == "checkbox":
+            widget = PropertyDropdown(
+                label=spec.display_key or spec.name,
+                options=["False", "True"],
+                initial="True" if bool(spec.value) else "False",
+            )
+            widget.value_changed.connect(
+                lambda text, s=spec: self._handle_spec_release(s, text == "True")
+            )
+            self._dynamic_sliders[spec.key] = widget
+            self._content_layout.addWidget(widget)
+            return
+
+        if spec.widget_hint == "color" and spec.options:
+            widget = PropertyDropdown(
+                label=spec.display_key or spec.name,
+                options=list(spec.options),
+                initial=str(spec.value),
+            )
+            widget.value_changed.connect(
+                lambda text, s=spec: self._handle_spec_release(s, text)
+            )
+            self._dynamic_sliders[spec.key] = widget
+            self._content_layout.addWidget(widget)
+            return
+
+        if spec.widget_hint == "text":
+            widget = PropertyString(
+                label=spec.display_key or spec.name,
+                initial=str(spec.value),
+            )
+            if spec.apply_mode == "live_safe":
+                widget.value_changed.connect(lambda text, s=spec: self._handle_spec_drag(s, text))
+            widget.value_released.connect(lambda text, s=spec: self._handle_spec_release(s, text))
+            self._dynamic_sliders[spec.key] = widget
+            self._content_layout.addWidget(widget)
+            return
+
+        self._content_layout.addWidget(self._build_read_only_row(spec))
+
+    def _build_read_only_row(self, spec: Any) -> QWidget:
+        value_text = spec.value
+        if isinstance(value_text, float):
+            value_text = f"{value_text:.3f}"
+        elif isinstance(value_text, list):
+            value_text = str(value_text)
+        elif not isinstance(value_text, str):
+            value_text = str(value_text)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        name_lbl = QLabel(spec.display_key or spec.name)
+        name_lbl.setStyleSheet("color: #ccc; font-size: 12px;")
+        val_lbl = QLabel(value_text)
+        val_lbl.setStyleSheet("color: #888; font-size: 12px;")
+        row.addWidget(name_lbl)
+        row.addStretch()
+        row.addWidget(val_lbl)
+        layout.addLayout(row)
+
+        reason = spec.read_only_reason or (
+            "reload-required value" if spec.apply_mode == "reload_only" else ""
+        )
+        if reason:
+            reason_lbl = QLabel(reason)
+            reason_lbl.setWordWrap(True)
+            reason_lbl.setStyleSheet("color: #666; font-size: 10px; padding-left: 2px;")
+            layout.addWidget(reason_lbl)
+
+        return container
+
+    @staticmethod
+    def _fallback_range_hint(value: float) -> tuple[float, float, float]:
+        numeric = float(value)
+        if -1.0 <= numeric <= 1.0:
+            return (-5.0, 5.0, 0.1)
+        return (numeric - 10.0, numeric + 10.0, 0.1)
+
+    def _handle_spec_drag(self, spec: Any, value: Any) -> None:
+        if spec.read_only:
+            return
+        if spec.apply_mode == "preview_only":
+            if self._file_watcher:
+                self._file_watcher.pause()
+            self._engine_state.set_interaction_state("previewing")
+            target_var = self._current_var_name or ""
+            prop_name = spec.param_name or spec.name
+            self._hot_swap.apply_single_property(target_var, prop_name, value)
+            self._engine_state.request_render()
+            return
+        if spec.apply_mode != "live_safe":
+            self._queue_commit(spec, value, immediate=False)
+            return
+
         if self._file_watcher:
             self._file_watcher.pause()
-
-        # Fast path: apply directly to scene mobject (in-memory)
         self._engine_state.set_interaction_state("previewing")
+        target_var = self._current_var_name or ""
+        prop_name = spec.param_name or spec.name
         self._hot_swap.apply_single_property(target_var, prop_name, value)
-        self._queue_commit(target_var, prop_name, value, kind="property")
-
-        # Trigger re-render
+        self._queue_commit(spec, value, immediate=False)
         self._engine_state.request_render()
 
-    def _on_release(self, target_var: str, prop_name: str, value: float) -> None:
-        """Handle slider release — save to disk atomically.
-
-        Slow path: AST surgery → atomic file save → resume watcher.
-        This is the only time we touch the SSD.
-        """
-        self._queue_commit(target_var, prop_name, value, kind="property", immediate=True)
+    def _handle_spec_release(self, spec: Any, value: Any) -> None:
+        if spec.read_only:
+            return
+        self._queue_commit(spec, value, immediate=True)
 
     # -------------------------------------------------------------------------
     # Transform Callbacks
@@ -810,28 +906,43 @@ class PropertyPanel(QDockWidget):
         # We emit a signal so main.py can debounce and handle the full reload safely
         if hasattr(self, 'transform_drag_requested'):
             self.transform_drag_requested.emit(target_var, method_name, value)
-            self._queue_commit(target_var, method_name, value, kind="transform")
         else:
             # Fallback if signal isn't wired up yet
             self._ast_mutator.update_transform_method(target_var, method_name, value)
             import os
             scene_file = self._ast_mutator._file_path
             if scene_file:
-                self._ast_mutator.save_atomic()
-                self._hot_swap.reload_from_file(scene_file)
+                if getattr(self._engine_state, 'is_external_reload_pending', False):
+                    logger.warning("Property Panel transform save aborted: External file edit detected.")
+                else:
+                    self._ast_mutator.save_atomic()
+                    self._hot_swap.reload_from_file(scene_file)
             self._engine_state.request_render()
 
     def _on_transform_release(self, target_var: str, method_name: str, value: float) -> None:
         """Slow path for transform (e.g. scale) updates."""
-        self._queue_commit(target_var, method_name, value, kind="transform", immediate=True)
+        if hasattr(self, 'transform_release_requested'):
+            self.transform_release_requested.emit()
 
     # -------------------------------------------------------------------------
     # Animation Callbacks
     # -------------------------------------------------------------------------
     def _on_animation_type_change(self, target_var: str, old_method: str, new_method: str) -> None:
         """Change animation effect directly in AST and save."""
+        if getattr(self._engine_state, 'is_external_reload_pending', False):
+            logger.warning("Animation type save aborted: External file edit detected.")
+            return
+
+        if self._file_watcher:
+            self._file_watcher.pause()
+
         self._ast_mutator.update_animation_method(target_var, old_method, new_method)
-        self._ast_mutator.save_atomic()
+
+        if self._file_watcher:
+            self._ast_mutator.save_atomic()
+            self._file_watcher.notify_internal_commit()
+            self._file_watcher.resume()
+
         logger.info(f"Animation effect changed: {old_method} -> {new_method} for {target_var}")
 
     def _on_animation_kwarg_drag(self, target_var: str, kwarg_name: str, value: float) -> None:
@@ -843,64 +954,25 @@ class PropertyPanel(QDockWidget):
 
     def _on_animation_kwarg_release(self, target_var: str, kwarg_name: str, value: float) -> None:
         """Update animation kwarg in AST and save."""
+        if getattr(self._engine_state, 'is_external_reload_pending', False):
+            logger.warning("Animation kwarg save aborted: External file edit detected.")
+            return
+
+        if self._file_watcher:
+            self._file_watcher.pause()
+
         self._ast_mutator.update_animation_kwarg(target_var, kwarg_name, value)
-        self._ast_mutator.save_atomic()
+
+        if self._file_watcher:
+            self._ast_mutator.save_atomic()
+            self._file_watcher.notify_internal_commit()
+            self._file_watcher.resume()
+
         logger.info(f"Animation kwarg released: {target_var} ({kwarg_name}={value})")
-
     def sync_from_code(self) -> None:
-        """State Reconciliation: Update sliders from current AST values.
-
-        Called after an external code edit to sync GUI with code.
-        Blocks signals to prevent triggering the GUI→Code path.
-        """
-        if not self._current_var_name:
-            return
-            
-        ref = self._ast_mutator.get_binding_by_name(self._current_var_name)
-        if not ref:
-            return
-
-        ast_props = ref.properties
-        schema_props = MANIM_SCHEMA.get(ref.constructor_name, DEFAULT_VMOBJECT_SCHEMA).copy()
-        
-        props = schema_props.copy()
-        props.update(ast_props)
-
-        for prop_name, widget in self._dynamic_sliders.items():
-            if prop_name in props:
-                val = props[prop_name]
-                if isinstance(val, (int, float)) and isinstance(widget, PropertySlider):
-                    widget.set_value(float(val))
-                elif isinstance(val, str) and isinstance(widget, PropertyString):
-                    widget.set_value(val)
-                    
-        if "_scale" in self._dynamic_sliders:
-            scale_val = ref.transforms.get("scale", 1.0)
-            self._dynamic_sliders["_scale"].set_value(float(scale_val))
-            
-        if "_rotate" in self._dynamic_sliders:
-            rotate_val = ref.transforms.get("rotate", 0.0)
-            self._dynamic_sliders["_rotate"].set_value(float(rotate_val))
-            
-        # Sync animation effects
-        target_anim = None
-        for anim in self._ast_mutator.animations:
-            if anim.target_var == self._current_var_name:
-                target_anim = anim
-                break
-                
-        if target_anim:
-            if "_anim_dropdown" in self._dynamic_sliders:
-                # Keep case sensitivity for display if possible
-                anim_effects = ["Create", "Write", "FadeIn", "FadeOut", "GrowFromCenter", "SpinInFromNothing", "DrawBorderThenFill"]
-                current_effect = next((e for e in anim_effects if e.lower() == target_anim.method_name.lower()), target_anim.method_name)
-                self._dynamic_sliders["_anim_dropdown"].set_value(current_effect)
-                
-            if "_run_time" in self._dynamic_sliders:
-                run_time_val = target_anim.kwargs.get("run_time", 1.0)
-                self._dynamic_sliders["_run_time"].set_value(float(run_time_val))
-
-        logger.info("Dynamic sliders synced from code (State Reconciliation)")
+        """Rebuild from source-of-truth after file or AST changes."""
+        self._build_dynamic_ui()
+        logger.info("Dynamic property panel rebuilt from code")
 
     def commit_pending_edits(self) -> None:
         """Compatibility hook used before export.
@@ -942,7 +1014,7 @@ class PropertyPanel(QDockWidget):
         strategy = self._ast_mutator.plan_property_persistence(
             selection.variable_name,
             "__selection__",
-            source_key=selection.source_key,
+            source_key=getattr(selection, "nearest_editable_source_key", None) or selection.source_key,
             path=tuple(selection.path or ()),
         )
         rows.append(("persist", strategy.mode))
@@ -974,17 +1046,15 @@ class PropertyPanel(QDockWidget):
 
     def _queue_commit(
         self,
-        target_var: str,
-        prop_name: str,
+        spec: Any,
         value: Any,
         *,
-        kind: str,
         immediate: bool = False,
     ) -> None:
-        key = (kind, target_var, prop_name)
-        self._pending_commits[key] = (target_var, prop_name, value)
-        widget = self._dynamic_sliders.get(prop_name)
-        if isinstance(widget, PropertySlider):
+        key = ("spec", self._current_var_name or "", spec.key)
+        self._pending_commits[key] = (spec, value)
+        widget = self._dynamic_sliders.get(spec.key)
+        if hasattr(widget, "set_pending"):
             widget.set_pending(True)
             self._pending_widgets[key] = widget
         self._engine_state.interaction_burst_active = True
@@ -1007,16 +1077,18 @@ class PropertyPanel(QDockWidget):
         self._engine_state.set_interaction_state(self._engine_state.STATE_COMMITTING)
 
         changed = False
-        for (kind, _target_var, _prop_name), (target_var, prop_name, value) in commits:
-            if kind == "property":
-                if self._commit_property(target_var, prop_name, value): changed = True
-            elif kind == "transform":
-                if self._commit_transform(target_var, prop_name, value): changed = True
+        for _key, payload in commits:
+            spec, value = payload
+            if self._commit_property(spec, value):
+                changed = True
 
         if changed:
-            self._ast_mutator.save_atomic()
-            if self._file_watcher:
-                self._file_watcher.notify_internal_commit()
+            if getattr(self._engine_state, 'is_external_reload_pending', False):
+                logger.warning("Property panel commit aborted: External file edit detected.")
+            else:
+                self._ast_mutator.save_atomic()
+                if self._file_watcher:
+                    self._file_watcher.notify_internal_commit()
 
         for key, widget in list(self._pending_widgets.items()):
             if isinstance(widget, PropertySlider):
@@ -1029,16 +1101,21 @@ class PropertyPanel(QDockWidget):
         self._engine_state.set_interaction_state(self._engine_state.STATE_SETTLED)
         self._engine_state.reload_guard_mode = self._engine_state.RELOAD_ALLOW_FULL
 
-    def _commit_property(self, target_var: str, prop_name: str, value: Any) -> bool:
+    def _commit_property(self, spec: Any, value: Any) -> bool:
+        target_var = self._current_var_name or ""
+        prop_name = spec.param_name or spec.name
         selection = getattr(self._engine_state, "selected_object", None)
         strategy = self._ast_mutator.plan_property_persistence(
             target_var,
             prop_name,
-            source_key=getattr(selection, "source_key", None),
+            source_key=getattr(selection, "nearest_editable_source_key", None) or getattr(selection, "source_key", None),
             path=tuple(getattr(selection, "path", ()) or ()),
         )
         if strategy.no_persist:
             logger.info(f"Skipped persist for {target_var}.{prop_name}: {strategy.reason}")
+            self._engine_state.record_preview_drift(
+                f"{target_var}.{prop_name}: {strategy.reason}"
+            )
             return False
         if not self._ast_mutator.persist_property_edit(target_var, prop_name, value, strategy):
             logger.warning(f"Persist failed for {target_var}.{prop_name}: {strategy.reason}")
@@ -1051,11 +1128,14 @@ class PropertyPanel(QDockWidget):
         strategy = self._ast_mutator.plan_property_persistence(
             target_var,
             method_name,
-            source_key=getattr(selection, "source_key", None),
+            source_key=getattr(selection, "nearest_editable_source_key", None) or getattr(selection, "source_key", None),
             path=tuple(getattr(selection, "path", ()) or ()),
         )
         if strategy.no_persist:
             logger.info(f"Skipped transform persist for {target_var}.{method_name}: {strategy.reason}")
+            self._engine_state.record_preview_drift(
+                f"{target_var}.{method_name} transform: {strategy.reason}"
+            )
             return False
         self._ast_mutator.update_transform_method(target_var, method_name, value)
         logger.info(f"Transform committed: {target_var}.{method_name}({value})")

@@ -19,6 +19,8 @@ _TRACKED_PROJECT_ROOT: Optional[str] = None
 _PATCHED = False
 _ORIGINAL_MOBJECT_INIT = None
 _ORIGINAL_OPENGL_MOBJECT_INIT = None
+_ORIGINAL_VMOBJECT_INIT = None
+_ORIGINAL_OPENGL_VMOBJECT_INIT = None
 
 
 def configure_tracking(
@@ -37,14 +39,19 @@ def reset_creation_tracking() -> None:
 
 def patch_manim_creation_tracking() -> None:
     global _PATCHED, _ORIGINAL_MOBJECT_INIT, _ORIGINAL_OPENGL_MOBJECT_INIT
+    global _ORIGINAL_VMOBJECT_INIT, _ORIGINAL_OPENGL_VMOBJECT_INIT
     if _PATCHED:
         return
 
     from manim.mobject.mobject import Mobject
     from manim.mobject.opengl.opengl_mobject import OpenGLMobject
+    from manim.mobject.types.vectorized_mobject import VMobject
+    from manim.mobject.opengl.opengl_vectorized_mobject import OpenGLVMobject
 
     _ORIGINAL_MOBJECT_INIT = Mobject.__init__
     _ORIGINAL_OPENGL_MOBJECT_INIT = OpenGLMobject.__init__
+    _ORIGINAL_VMOBJECT_INIT = VMobject.__init__
+    _ORIGINAL_OPENGL_VMOBJECT_INIT = OpenGLVMobject.__init__
 
     def _patched_mobject_init(self: Any, *args: Any, **kwargs: Any) -> None:
         _ORIGINAL_MOBJECT_INIT(self, *args, **kwargs)
@@ -54,16 +61,34 @@ def patch_manim_creation_tracking() -> None:
         _ORIGINAL_OPENGL_MOBJECT_INIT(self, *args, **kwargs)
         _attach_runtime_provenance(self)
 
+    def _patched_vmobject_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        _ORIGINAL_VMOBJECT_INIT(self, *args, **kwargs)
+        _attach_runtime_provenance(self)
+
+    def _patched_opengl_vmobject_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        _ORIGINAL_OPENGL_VMOBJECT_INIT(self, *args, **kwargs)
+        _attach_runtime_provenance(self)
+
     Mobject.__init__ = _patched_mobject_init
     OpenGLMobject.__init__ = _patched_opengl_mobject_init
+    VMobject.__init__ = _patched_vmobject_init
+    OpenGLVMobject.__init__ = _patched_opengl_vmobject_init
     _PATCHED = True
 
 
 def _attach_runtime_provenance(mobject: Any) -> None:
+    if hasattr(mobject, "_bisync_line_number"):
+        return
     try:
-        frame = sys._getframe(1)
+        frame = sys._getframe(2) # Start slightly higher up
         while frame:
             filename = frame.f_code.co_filename
+            
+            # Fast-path optimization: Skip manim internals rapidly without breaking user paths
+            if "site-packages/manim" in filename.replace("\\", "/"):
+                frame = frame.f_back
+                continue
+                
             if _matches_source_frame(filename):
                 resolved = str(Path(filename).resolve())
                 line_number = frame.f_lineno

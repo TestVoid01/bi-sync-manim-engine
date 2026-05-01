@@ -28,6 +28,7 @@ def decide_scene_sync(
     new_bindings: dict[str, ASTNodeRef],
     old_animations: list[ASTAnimationRef],
     new_animations: list[ASTAnimationRef],
+    can_fast_apply_property=None,
 ) -> SceneSyncDecision:
     """Choose between a fast property patch and a full scene reload."""
 
@@ -58,9 +59,19 @@ def decide_scene_sync(
             reasons.append(f"{var_name}: transforms changed")
             return SceneSyncDecision(mode="full_reload", reasons=reasons)
 
+        if _call_summaries(getattr(old_ref, "modifier_calls", [])) != _call_summaries(getattr(new_ref, "modifier_calls", [])):
+            reasons.append(f"{var_name}: source chain changed")
+            return SceneSyncDecision(mode="full_reload", reasons=reasons)
+
         for prop_name, new_val in new_ref.properties.items():
             old_val = old_ref.properties.get(prop_name)
             if old_val != new_val:
+                if callable(can_fast_apply_property) and not can_fast_apply_property(prop_name, new_val):
+                    reasons.append(f"{var_name}: property '{prop_name}' requires reload")
+                    return SceneSyncDecision(mode="full_reload", reasons=reasons)
+                if isinstance(new_val, (list, tuple, dict)):
+                    reasons.append(f"{var_name}: property '{prop_name}' is structural")
+                    return SceneSyncDecision(mode="full_reload", reasons=reasons)
                 property_updates.setdefault(var_name, {})[prop_name] = new_val
 
         for prop_name in old_ref.properties:
@@ -91,4 +102,23 @@ def _animation_summaries(animation_refs: list[ASTAnimationRef]) -> tuple[Any, ..
             _hashable_val(ref.kwargs),
         )
         for ref in animation_refs
+    )
+
+
+def _call_summaries(call_refs: list[Any]) -> tuple[Any, ...]:
+    def _param_value(param: Any) -> Any:
+        value_ref = getattr(param, "value_ref", None)
+        literal = getattr(value_ref, "literal_value", None)
+        raw = getattr(value_ref, "raw_code", "")
+        if isinstance(literal, list):
+            literal = tuple(literal)
+        return (getattr(param, "param_name", ""), literal, raw)
+
+    return tuple(
+        (
+            getattr(ref, "owner_kind", ""),
+            getattr(ref, "owner_name", ""),
+            tuple(_param_value(param) for param in getattr(ref, "params", [])),
+        )
+        for ref in call_refs
     )
