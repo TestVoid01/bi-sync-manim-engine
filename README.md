@@ -60,7 +60,7 @@ docs/                    → Architecture documentation
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/bi-sync-manim-engine.git
+git clone https://github.com/TestVoid01/bi-sync-manim-engine.git
 cd bi-sync-manim-engine
 
 # Install dependencies
